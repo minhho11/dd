@@ -1,0 +1,68 @@
+name: build-and-deploy
+
+# Manual trigger: build the Linux binary, push it to the VPS, and run it.
+# Run from the Actions tab ("Run workflow") so a traffic-generating run is
+# always deliberate. Add a push/tag trigger yourself if you want auto-deploys.
+on:
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "dd arguments (DATABASE_DSN is injected from secrets)"
+        required: true
+        default: "-urls https://example.com -workers 20 -requests 500"
+      detached:
+        description: "Run in background (nohup) instead of waiting for it to finish"
+        type: boolean
+        default: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build static Linux binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o dd .
+
+      - name: Copy binary to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          source: dd
+          target: /opt/dd
+          overwrite: true
+
+      - name: Run on VPS
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DATABASE_DSN: ${{ secrets.DATABASE_DSN }}
+          DD_ARGS: ${{ inputs.args }}
+          DD_DETACHED: ${{ inputs.detached }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          envs: DATABASE_DSN,DD_ARGS,DD_DETACHED
+          script: |
+            set -e
+            chmod +x /opt/dd/dd
+            cd /opt/dd
+            if [ "$DD_DETACHED" = "true" ]; then
+              # Background run; logs to /opt/dd/dd.out, errors to /opt/dd/err.log.
+              nohup env DATABASE_DSN="$DATABASE_DSN" ./dd $DD_ARGS -error-log /opt/dd/err.log \
+                > /opt/dd/dd.out 2>&1 &
+              echo "started dd in background (pid $!) — see /opt/dd/dd.out"
+            else
+              # Foreground; the action waits and shows the summary.
+              env DATABASE_DSN="$DATABASE_DSN" ./dd $DD_ARGS
+            fi
