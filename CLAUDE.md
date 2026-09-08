@@ -35,7 +35,10 @@ extra attempts through another proxy on block/failure), `-rps` (0 = unlimited),
 `-error-log err.log` (errors only, appended), `-human` (true; realistic browser
 headers, stable identity per proxy), `-user-agent` (override UA), `-cache-bust`
 (+`-cache-bust-param`, default `_`; unique query per request to bypass nginx/CDN
-caches), `-timeout`, `-insecure`, `-verbose`. Total requests = `requests × len(urls)`.
+caches), `-watch-config` (load run params from the DB `config` table and restart on
+change; requires `-dsn`), `-report-interval` (30s; flush per-URL success/fail to the
+`report` table; 0 disables; needs `-dsn`), `-timeout`, `-insecure`, `-verbose`.
+Total requests = `requests × len(urls)`.
 
 ## Architecture
 
@@ -46,6 +49,12 @@ testable; keep new wiring there, not in `main()`.
 
 Packages under `internal/`:
 
+- **`config`** — a single-row `config` table (bun) holding the *run params* (urls,
+  workers, requests, retries, rps, timeout, cache-bust, human, user-agent, insecure).
+  `Repo` has `EnsureSchema` (table + a NOTIFY trigger), `EnsureDefault` (seed id=1 if
+  absent), `Load`, `Save`, and `Watch(ctx)` which turns Postgres `LISTEN config_changed`
+  into a Go channel. Used only in `-watch-config` mode. Operational plumbing (dsn,
+  block/proxy internals, output files) stays on the CLI, not in this table.
 - **`proxy`** — two bun models and their repos, plus the block cache:
   - `Proxy` (table `proxies`) + `Repo`: the proxy list.
   - `ProxyBlock` (table `proxies_blocked`, unique on `(proxy_id, domain)`) + `BlockRepo`:
@@ -82,9 +91,24 @@ Packages under `internal/`:
   cool a proxy down proxy-wide (distinct from the per-domain block store). `Summary` is
   mutex-guarded (success / blocked / non-2xx / failed / skipped / retries + status histogram).
 - **`report`** — streams each `Result` to `-out` as CSV or JSONL (by extension), concurrency-safe.
+- **`metrics`** — the in-memory per-URL success/fail variable (`Metrics`) plus the `report`
+  **table** + `Repo`. `Record` runs on every result (in-memory, cheap); a ticker (`Run`) flushes
+  each URL's delta-since-last-flush to the table every `-report-interval` (default 30s) as a batch
+  insert, keeping cumulative totals in memory (`Totals`), with a final flush on shutdown. Lives for
+  the whole process, so the tally spans `-watch-config` restarts. (Distinct from the `report`
+  package above — same word, different concern.)
 
 Two independent quarantine mechanisms, don't conflate them: **block store** = per-(proxy,
 domain), persisted in Postgres, triggered by *blocked HTTP responses*. **health** =
 per-proxy, in-memory, triggered by *transport failures* (dead/unreachable proxy).
 
-The DB is optional by design: no `-dsn`/`DATABASE_DSN` means direct requests, not an error.
+**Run params: CLI vs DB.** Normally run params come from CLI flags: `run` builds a
+`cfgdb.Config` via `cliRunConfig` and calls `executeOneRun` once. With `-watch-config`,
+`runWatched` instead loads that `Config` from the `config` table, seeds it from the CLI
+defaults on first run, and supervises: it runs the current config and, on a
+`LISTEN config_changed` event (fired by the table's trigger on any change), cancels the
+current run and restarts with the freshly-loaded config. A finished run idles until the
+next change. `executeOneRun` is the single code path both modes share.
+
+The DB is optional by design: no `-dsn`/`DATABASE_DSN` means direct requests, not an
+error (but `-watch-config` requires a DSN).

@@ -19,6 +19,7 @@ request rate**, and **exports** every result.
 1. [Design goals](#design-goals)
 2. [Package layout](#package-layout)
 3. [Data model](#data-model)
+3a. [Config-driven mode (`-watch-config`)](#config-driven-mode--watch-config)
 4. [Workflow — startup](#workflow--startup)
 5. [Workflow — worker pool (fan-out)](#workflow--worker-pool-fan-out)
 6. [Workflow — per-request lifecycle](#workflow--per-request-lifecycle)
@@ -52,6 +53,8 @@ request rate**, and **exports** every result.
 dd/
 ├── main.go                      # CLI: flags, wiring, orchestration, summary/export
 └── internal/
+    ├── config/      config.go    # `config` table + LISTEN/NOTIFY watch (run params)
+    ├── metrics/     metrics.go   # in-memory per-URL success/fail + `report` table flush
     ├── db/          db.go        # open + ping the bun handle (pgdriver/pgdialect)
     ├── proxy/       proxy.go     # Proxy model + Repo (the proxy list)
     │                block.go     # ProxyBlock model + BlockRepo + BlockCache
@@ -70,7 +73,39 @@ injected args slice and output writer, so it is testable without a process.
 
 ## Data model
 
-Two tables, created on startup with `CREATE TABLE IF NOT EXISTS` (no migration tool).
+Four tables, created on startup with `CREATE TABLE IF NOT EXISTS` (no migration tool).
+
+### `report` — per-URL success/fail time series
+
+Written every `-report-interval` (default 30s) when a DSN is set. Each row is one
+interval's **delta** for one URL.
+
+| column | type | notes |
+|---|---|---|
+| `id` | bigint PK | autoincrement |
+| `url` | text | the target URL |
+| `success` | bigint | completed, not blocked, status < 400 (this interval) |
+| `fail` | bigint | transport error, skip, block, or status ≥ 400 (this interval) |
+| `created_at` | timestamptz | interval timestamp |
+
+
+### `config` — run parameters (single row, id=1)
+
+Present only in `-watch-config` mode. Holds *what to hit and how hard*; a trigger fires
+`NOTIFY config_changed` on every insert/update.
+
+| column | type | notes |
+|---|---|---|
+| `id` | bigint PK | always 1 (singleton) |
+| `urls` | text | comma-separated targets |
+| `workers`, `requests`, `retries` | int | `requests = 0` → until-blocked |
+| `rps` | double | rate cap; 0 = unlimited |
+| `timeout_seconds` | int | per-request timeout |
+| `cache_bust` | bool | + `cache_bust_param` (text) |
+| `human` | bool | + `user_agent` (text) |
+| `insecure` | bool | skip TLS verify |
+| `updated_at` | timestamptz | bumped on save; shown as the config "version" |
+
 
 ### `proxies` — the proxy list
 
@@ -378,6 +413,47 @@ atomic counter seeded with the wall clock (`cachebust.go`): unique under concurr
 and different across runs. Existing query params and any fragment are preserved.
 `Result.URL` keeps the *clean* URL so the summary and export group logically.
 
+## Config-driven mode (`-watch-config`)
+
+Instead of taking run params from CLI flags, the tool can read them from the `config`
+table and **reconfigure itself live** when the row changes — no restart, no redeploy.
+
+```
+ startup:
+   EnsureSchema (config table + NOTIFY trigger)
+   EnsureDefault (seed id=1 from CLI defaults, only if absent)
+   Watch()  ── LISTEN config_changed ──► changes channel
+
+ supervisor loop:
+   rc := Load()               # current config row
+   run executeOneRun(rc) in a goroutine ─┐
+                                          │
+   select:                                │
+     ctx cancelled  ─► stop, return       │  (SIGINT/SIGTERM)
+     config changed ─► cancel run, reload, loop again
+     run finished   ─► print summary, then wait for next change
+```
+
+- The **trigger** (`dd_config_notify`) fires `pg_notify('config_changed', …)` on every
+  insert/update of the row; `config.Watch` delivers those over a coalesced Go channel
+  via a dedicated `pgdriver.Listener` connection.
+- On a change the current run's context is cancelled (workers + producer stop), the row
+  is reloaded, and `executeOneRun` is called again with the new config — so **every**
+  param (workers, urls, timeout, headers, cache-bust, rps, retries) takes effect,
+  uniformly, by rebuilding rather than piecemeal live-tuning.
+- Proxy endpoints and the block cache are opened **once** and reused across restarts, so
+  quarantine state survives a config change.
+- Operational plumbing (`-dsn`, block/proxy internals, `-out`, `-error-log`) stays on the
+  CLI; only the traffic-shaping params live in the table.
+
+Change the config from anywhere that can reach Postgres, e.g.:
+
+```sql
+UPDATE config SET workers = 50, urls = 'https://a.com,https://b.vn',
+                  rps = 100, cache_bust = true, updated_at = now()
+WHERE id = 1;
+```
+
 ## Configuration (flags)
 
 | flag | default | meaning |
@@ -405,6 +481,8 @@ and different across runs. Existing query params and any fragment are preserved.
 | `-error-log` | — | append **errors only** (failed requests, skips, warnings, fatal) to this file |
 | `-cache-bust` | false | append a unique query param to every request to bypass caches (nginx/CDN) |
 | `-cache-bust-param` | `_` | the cache-buster query param name |
+| `-watch-config` | false | load run params from the DB `config` table and restart the run when it changes (requires `-dsn`) |
+| `-report-interval` | 30s | flush per-URL success/fail counts to the `report` table this often (0 disables; needs `-dsn`) |
 
 ### Examples
 

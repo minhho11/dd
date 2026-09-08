@@ -19,8 +19,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/uptrace/bun"
+
+	cfgdb "github.com/minhho11/dd/internal/config"
 	"github.com/minhho11/dd/internal/db"
 	"github.com/minhho11/dd/internal/httpclient"
+	"github.com/minhho11/dd/internal/metrics"
 	"github.com/minhho11/dd/internal/pool"
 	"github.com/minhho11/dd/internal/proxy"
 	"github.com/minhho11/dd/internal/report"
@@ -52,6 +56,8 @@ type config struct {
 	errorLog       string
 	cacheBust      bool
 	cacheBustParam string
+	watchConfig    bool
+	reportInterval time.Duration
 }
 
 func main() {
@@ -69,7 +75,7 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 	if err != nil {
 		return err
 	}
-	if len(cfg.urls) == 0 {
+	if len(cfg.urls) == 0 && !cfg.watchConfig {
 		return fmt.Errorf("no urls provided")
 	}
 
@@ -96,97 +102,179 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 		}()
 	}
 
-	// Proxies and the block store live in Postgres. Without a DSN we run direct.
+	// Open the database once (shared by proxy state and, in watch mode, config).
+	var database *bun.DB
 	var endpoints []httpclient.ProxyEndpoint
 	var blocks pool.BlockStore
 	if cfg.dsn != "" {
+		database, err = db.Open(ctx, cfg.dsn, cfg.verbose)
+		if err != nil {
+			return fmt.Errorf("connect db: %w", err)
+		}
+		defer database.Close()
+
 		var cache *proxy.BlockCache
-		var cleanup func()
-		endpoints, cache, cleanup, err = openProxyState(ctx, cfg, out)
+		endpoints, cache, err = loadProxyState(ctx, database, cfg, out)
 		if err != nil {
 			return err
 		}
-		defer cleanup()
 		if cache != nil {
 			blocks = cache
 		}
 	} else {
 		fmt.Fprintln(out, "no -dsn/DATABASE_DSN set: running without proxies (direct)")
 	}
+	if cfg.watchConfig && database == nil {
+		return fmt.Errorf("-watch-config requires -dsn/DATABASE_DSN")
+	}
 
-	clients := httpclient.New(httpclient.Config{
-		Timeout:         cfg.timeout,
-		InsecureTLS:     cfg.insecure,
-		FollowRedirects: true,
-		Human:           cfg.human,
-		UserAgent:       cfg.userAgent,
-	}, endpoints)
+	// Metrics: in-memory per-URL success/fail, flushed to the report table every
+	// -report-interval. Its stop+final-flush must run before the DB is closed, so
+	// register it after the database defer (defers run LIFO).
+	var mtx *metrics.Metrics
+	if database != nil && cfg.reportInterval > 0 {
+		reportRepo := metrics.NewRepo(database)
+		if err := reportRepo.EnsureSchema(ctx); err != nil {
+			return fmt.Errorf("ensure report schema: %w", err)
+		}
+		mtx = metrics.New()
+		reporterCtx, reporterCancel := context.WithCancel(ctx)
+		reporterDone := make(chan struct{})
+		go func() {
+			defer close(reporterDone)
+			mtx.Run(reporterCtx, reportRepo, cfg.reportInterval, out)
+		}()
+		defer func() { reporterCancel(); <-reporterDone }()
+		fmt.Fprintf(out, "reporting per-URL success/fail to `report` table every %s\n", cfg.reportInterval)
+	}
 
-	wp := pool.New(clients, blocks, pool.Options{
+	onResult, closeHandlers, err := buildResultHandler(cfg, out, errLog, mtx)
+	if err != nil {
+		return err
+	}
+	defer closeHandlers()
+
+	tuning := poolTuning{failLimit: cfg.proxyFails, cooldown: cfg.proxyCool}
+
+	if cfg.watchConfig {
+		return runWatched(ctx, database, cfg, out, endpoints, blocks, tuning, onResult)
+	}
+
+	rc := cliRunConfig(cfg)
+	untilBlocked := !cfg.requestsSet && len(endpoints) > 0
+	summary := executeOneRun(ctx, out, rc, endpoints, blocks, tuning, onResult, untilBlocked)
+	printSummary(out, summary)
+	return nil
+}
+
+// poolTuning holds the operational proxy-health knobs that stay on the CLI (not
+// in the DB config), so both run paths pass them through unchanged.
+type poolTuning struct {
+	failLimit int
+	cooldown  time.Duration
+}
+
+// cliRunConfig maps CLI flags to a cfgdb.Config for the single-run path, so both
+// the CLI and the DB-watch paths drive the same executeOneRun.
+func cliRunConfig(cfg config) cfgdb.Config {
+	return cfgdb.Config{
+		URLs:           strings.Join(cfg.urls, ","),
 		Workers:        cfg.workers,
+		Requests:       cfg.requests,
 		Retries:        cfg.retries,
 		RPS:            cfg.rps,
-		ProxyFailLimit: cfg.proxyFails,
-		ProxyCooldown:  cfg.proxyCool,
+		TimeoutSeconds: int(cfg.timeout / time.Second),
 		CacheBust:      cfg.cacheBust,
 		CacheBustParam: cfg.cacheBustParam,
-	})
+		Human:          cfg.human,
+		UserAgent:      cfg.userAgent,
+		Insecure:       cfg.insecure,
+	}
+}
 
-	// Compose the per-result handler from optional verbose printing and export.
+// buildResultHandler composes the per-result callback (verbose print, export,
+// error log) shared by both run paths, plus a cleanup that closes the exporter.
+func buildResultHandler(cfg config, out io.Writer, errLog *log.Logger, mtx *metrics.Metrics) (func(pool.Result), func(), error) {
 	var handlers []func(pool.Result)
+	cleanup := func() {}
+
+	if mtx != nil {
+		handlers = append(handlers, metricsHandler(mtx))
+	}
 	if cfg.verbose {
 		handlers = append(handlers, verbosePrinter(out))
 	}
 	if cfg.out != "" {
 		w, err := report.New(cfg.out)
 		if err != nil {
-			return fmt.Errorf("open report %q: %w", cfg.out, err)
+			return nil, nil, fmt.Errorf("open report %q: %w", cfg.out, err)
 		}
-		defer func() {
+		cleanup = func() {
 			if cerr := w.Close(); cerr != nil {
 				fmt.Fprintln(out, "report close error:", cerr)
 				if errLog != nil {
 					errLog.Printf("report close error: %v", cerr)
 				}
 			}
-		}()
+		}
 		handlers = append(handlers, exportHandler(w))
 		fmt.Fprintf(out, "writing results to %s\n", cfg.out)
 	}
 	if errLog != nil {
 		handlers = append(handlers, errorLogHandler(errLog))
 	}
-	if len(handlers) > 0 {
-		wp.OnResult = func(r pool.Result) {
-			for _, h := range handlers {
-				h(r)
-			}
-		}
+
+	if len(handlers) == 0 {
+		return nil, cleanup, nil
 	}
+	return func(r pool.Result) {
+		for _, h := range handlers {
+			h(r)
+		}
+	}, cleanup, nil
+}
 
-	// "Until blocked" mode: -requests omitted AND proxies present -> keep firing
-	// until no proxy is usable for any target. In direct mode there is nothing to
-	// exhaust, so fall back to the fixed count.
-	untilBlocked := !cfg.requestsSet && len(endpoints) > 0
+// executeOneRun builds the clients and pool for one config, dispatches the jobs
+// (fixed count or until-blocked), and returns the summary. It returns when the
+// run completes or ctx is cancelled.
+func executeOneRun(ctx context.Context, out io.Writer, rc cfgdb.Config, endpoints []httpclient.ProxyEndpoint, blocks pool.BlockStore, tuning poolTuning, onResult func(pool.Result), untilBlocked bool) *pool.Summary {
+	clients := httpclient.New(httpclient.Config{
+		Timeout:         rc.Timeout(),
+		InsecureTLS:     rc.Insecure,
+		FollowRedirects: true,
+		Human:           rc.Human,
+		UserAgent:       rc.UserAgent,
+	}, endpoints)
 
+	wp := pool.New(clients, blocks, pool.Options{
+		Workers:        rc.Workers,
+		Retries:        rc.Retries,
+		RPS:            rc.RPS,
+		ProxyFailLimit: tuning.failLimit,
+		ProxyCooldown:  tuning.cooldown,
+		CacheBust:      rc.CacheBust,
+		CacheBustParam: rc.CacheBustParam,
+	})
+	wp.OnResult = onResult
+
+	urls := rc.URLList()
 	if untilBlocked {
 		fmt.Fprintf(out, "firing until all proxies blocked: %d urls, workers=%d, clients=%d, retries=%d, rps=%s\n",
-			len(cfg.urls), cfg.workers, clients.Size(), cfg.retries, rpsLabel(cfg.rps))
+			len(urls), rc.Workers, clients.Size(), rc.Retries, rpsLabel(rc.RPS))
 	} else {
-		total := cfg.requests * len(cfg.urls)
 		fmt.Fprintf(out, "firing %d requests: %d urls x %d, workers=%d, clients=%d, retries=%d, rps=%s\n",
-			total, len(cfg.urls), cfg.requests, cfg.workers, clients.Size(), cfg.retries, rpsLabel(cfg.rps))
+			rc.Requests*len(urls), len(urls), rc.Requests, rc.Workers, clients.Size(), rc.Retries, rpsLabel(rc.RPS))
 	}
 
-	jobs := make(chan pool.Job, cfg.workers)
+	jobs := make(chan pool.Job, rc.Workers)
 	go func() {
 		defer close(jobs)
 		if untilBlocked {
-			produceUntilBlocked(ctx, wp, cfg.urls, jobs)
+			produceUntilBlocked(ctx, wp, urls, jobs)
 			return
 		}
-		for i := 0; i < cfg.requests; i++ {
-			for _, u := range cfg.urls {
+		for i := 0; i < rc.Requests; i++ {
+			for _, u := range urls {
 				select {
 				case <-ctx.Done():
 					return
@@ -196,9 +284,66 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 		}
 	}()
 
-	summary := wp.Run(ctx, jobs)
-	printSummary(out, summary)
-	return nil
+	return wp.Run(ctx, jobs)
+}
+
+// runWatched loads the config from the DB, runs it, and restarts the run whenever
+// the config row changes (via LISTEN/NOTIFY). A finished run idles until the next
+// change. Returns when ctx is cancelled (SIGINT/SIGTERM).
+func runWatched(ctx context.Context, database *bun.DB, cfg config, out io.Writer, endpoints []httpclient.ProxyEndpoint, blocks pool.BlockStore, tuning poolTuning, onResult func(pool.Result)) error {
+	cfgRepo := cfgdb.NewRepo(database)
+	if err := cfgRepo.EnsureSchema(ctx); err != nil {
+		return fmt.Errorf("ensure config schema: %w", err)
+	}
+	// Seed the row from the CLI defaults on first run; an existing row is kept.
+	if err := cfgRepo.EnsureDefault(ctx, cliRunConfig(cfg)); err != nil {
+		return fmt.Errorf("seed config: %w", err)
+	}
+
+	changes, err := cfgRepo.Watch(ctx)
+	if err != nil {
+		return fmt.Errorf("watch config: %w", err)
+	}
+	fmt.Fprintln(out, "watching config table for changes (LISTEN config_changed)")
+
+	for {
+		rc, err := cfgRepo.Load(ctx)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		fmt.Fprintf(out, "── config v%s: urls=%q workers=%d requests=%d retries=%d rps=%s cache-bust=%t\n",
+			rc.UpdatedAt.Format(time.RFC3339), rc.URLs, rc.Workers, rc.Requests, rc.Retries, rpsLabel(rc.RPS), rc.CacheBust)
+
+		untilBlocked := rc.Requests <= 0 && len(endpoints) > 0
+
+		runCtx, runCancel := context.WithCancel(ctx)
+		done := make(chan *pool.Summary, 1)
+		go func() { done <- executeOneRun(runCtx, out, rc, endpoints, blocks, tuning, onResult, untilBlocked) }()
+
+		select {
+		case <-ctx.Done():
+			runCancel()
+			<-done
+			return nil
+		case <-changes:
+			// Config changed: stop the current run and loop to reload.
+			fmt.Fprintln(out, "config changed — restarting run")
+			runCancel()
+			<-done
+			continue
+		case summary := <-done:
+			// Run finished on its own; idle until the next change.
+			runCancel()
+			printSummary(out, summary)
+			fmt.Fprintln(out, "run complete — waiting for next config change")
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-changes:
+				continue
+			}
+		}
+	}
 }
 
 func parseFlags(args []string, out io.Writer) (config, error) {
@@ -228,6 +373,8 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	errorLog := fs.String("error-log", "", "append error logs (failed requests + warnings) to this file")
 	cacheBust := fs.Bool("cache-bust", false, "append a unique query param to each request to bypass caches (nginx/CDN)")
 	cacheBustParam := fs.String("cache-bust-param", "_", "query param name used for cache busting")
+	watchConfig := fs.Bool("watch-config", false, "load run params from the DB `config` table and restart the run when it changes")
+	reportInterval := fs.Duration("report-interval", 30*time.Second, "insert per-URL success/fail counts into the DB `report` table this often (0 disables; needs -dsn)")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -265,34 +412,27 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		errorLog:       *errorLog,
 		cacheBust:      *cacheBust,
 		cacheBustParam: *cacheBustParam,
+		watchConfig:    *watchConfig,
+		reportInterval: *reportInterval,
 	}, nil
 }
 
-// openProxyState connects to Postgres, ensures both schemas, seeds any proxies
-// passed via -proxies, prunes stale block rows, and returns the proxy endpoints
-// plus the (lazy) block cache. The returned cleanup closes the DB.
-func openProxyState(ctx context.Context, cfg config, out io.Writer) ([]httpclient.ProxyEndpoint, *proxy.BlockCache, func(), error) {
-	database, err := db.Open(ctx, cfg.dsn, cfg.verbose)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("connect db: %w", err)
-	}
-	cleanup := func() { _ = database.Close() }
-
+// loadProxyState ensures the proxy/block schemas, seeds any -proxies, prunes
+// stale block rows, and returns the proxy endpoints plus the (lazy) block cache.
+// The database handle is owned by the caller.
+func loadProxyState(ctx context.Context, database *bun.DB, cfg config, out io.Writer) ([]httpclient.ProxyEndpoint, *proxy.BlockCache, error) {
 	proxyRepo := proxy.NewRepo(database)
 	blockRepo := proxy.NewBlockRepo(database, cfg.blockAfter, cfg.blockFor)
 	if err := proxyRepo.EnsureSchema(ctx); err != nil {
-		cleanup()
-		return nil, nil, nil, fmt.Errorf("ensure proxies schema: %w", err)
+		return nil, nil, fmt.Errorf("ensure proxies schema: %w", err)
 	}
 	if err := blockRepo.EnsureSchema(ctx); err != nil {
-		cleanup()
-		return nil, nil, nil, fmt.Errorf("ensure proxies_blocked schema: %w", err)
+		return nil, nil, fmt.Errorf("ensure proxies_blocked schema: %w", err)
 	}
 
 	for _, purl := range cfg.seed {
 		if err := proxyRepo.Add(ctx, purl); err != nil {
-			cleanup()
-			return nil, nil, nil, fmt.Errorf("seed proxy %q: %w", purl, err)
+			return nil, nil, fmt.Errorf("seed proxy %q: %w", purl, err)
 		}
 	}
 
@@ -304,8 +444,7 @@ func openProxyState(ctx context.Context, cfg config, out io.Writer) ([]httpclien
 
 	proxies, err := proxyRepo.LoadActive(ctx)
 	if err != nil {
-		cleanup()
-		return nil, nil, nil, fmt.Errorf("load proxies: %w", err)
+		return nil, nil, fmt.Errorf("load proxies: %w", err)
 	}
 
 	cache := proxy.NewBlockCache(blockRepo, cfg.blockTTL, cfg.blockCacheMax)
@@ -321,7 +460,7 @@ func openProxyState(ctx context.Context, cfg config, out io.Writer) ([]httpclien
 	for i, p := range proxies {
 		endpoints[i] = httpclient.ProxyEndpoint{ID: p.ID, URL: p.URL}
 	}
-	return endpoints, cache, cleanup, nil
+	return endpoints, cache, nil
 }
 
 // produceUntilBlocked feeds jobs round-robin over the URLs, stopping once no
@@ -385,6 +524,16 @@ func errorLogHandler(l *log.Logger) func(pool.Result) {
 			via = r.ProxyURL
 		}
 		l.Printf("request error url=%q via=%s attempts=%d: %v", r.URL, via, r.Attempts, r.Err)
+	}
+}
+
+// metricsHandler records each result into the in-memory per-URL tally. A result
+// counts as success only when it completed, was not detected as a block, and had
+// a status < 400; everything else (transport error, skip, block, non-2xx) is a fail.
+func metricsHandler(m *metrics.Metrics) func(pool.Result) {
+	return func(r pool.Result) {
+		success := r.Err == nil && !r.Blocked && r.StatusCode < 400
+		m.Record(r.URL, success)
 	}
 }
 
