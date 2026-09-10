@@ -60,8 +60,9 @@ headless, set false to watch the browser).
 (GET/POST/PUT/PATCH/DELETE/HEAD; ignored in browser mode), `params` (JSON — for http:
 query string for GET/HEAD/DELETE, request body for POST/PUT/PATCH; for browser: a
 `{"steps":[...]}` flow, see below), `weight` (relative share of the worker pool,
-normalized), `requests` (0 = until blocked; in browser mode `1` runs the flow once as
-a single test, `N` repeats it under load), `enabled`. New columns are added on startup
+normalized), `requests` (http: 0 = until blocked; browser: always finite — `1` runs
+the flow once as a single test, `N` repeats it under load, and `0`/unset falls back
+to the global default count since browser has no "until blocked" mode), `enabled`. New columns are added on startup
 via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (still no migration tool).
 
 **Browser mode (`mode='browser'`):** `params` is a JSON flow run in a headless
@@ -85,7 +86,13 @@ block or a connection failure retries through another proxy, a page/assertion fa
 does not. **SOCKS proxies are skipped for browser jobs** (`isSOCKS` in `pool.pick`/
 `AnyUsable`) — Chromium cannot authenticate SOCKS5 proxies, so a browser flow can
 only use HTTP/HTTPS proxies (dd answers their `407` over the CDP Fetch domain) or run
-direct; http-mode jobs still use SOCKS proxies normally. **Per-step debug logging** is
+direct; http-mode jobs still use SOCKS proxies normally. When no proxy is usable for a
+browser job (e.g. the pool is all SOCKS), `do` **falls back to a direct run once** (a
+synthetic direct `httpclient.Client`, `ProxyID 0`) rather than skipping — so browser
+targets still run when only SOCKS proxies exist. Consequently browser targets are
+always finite (`produceTarget` skips the "until blocked" loop for them; a browser
+target with `requests<=0` uses the global default count), since a direct fallback has
+no proxy-exhaustion stop condition. **Per-step debug logging** is
 toggled by the `browser_debug` config key (seed flag `-browser-debug`): when on, each
 browser navigation/step logs ok/FAIL during the run (`pool.fireBrowser` builds a
 prefixed `browser.Options.Logf`); flip it live in the `config` table. Example:

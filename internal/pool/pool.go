@@ -296,11 +296,16 @@ func (p *Pool) do(ctx context.Context, job Job) Result {
 
 		client := p.pick(ctx, domain, exclude, isBrowser(job.Mode))
 		if client == nil {
-			if attempts == 0 {
+			// A browser job can still run without a proxy (e.g. only SOCKS proxies
+			// exist, which Chromium can't use) — fall back to a direct run, once.
+			if isBrowser(job.Mode) && !exclude[0] {
+				client = &httpclient.Client{} // synthetic direct client (ProxyID 0)
+			} else if attempts == 0 {
 				return Result{URL: job.URL, Domain: domain, Err: ErrAllBlocked}
+			} else {
+				last.Attempts = attempts
+				return last
 			}
-			last.Attempts = attempts
-			return last
 		}
 		exclude[client.ProxyID] = true
 

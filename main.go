@@ -424,7 +424,9 @@ func targetMode(t cfgdb.Target, rc cfgdb.Config, hasProxies bool) string {
 	if t.Requests > 0 {
 		return fmt.Sprintf("%d req", t.Requests)
 	}
-	if hasProxies {
+	// Browser targets are always finite (no "until blocked" — a browser can fall
+	// back to a direct run, so there is no proxy-exhaustion stop condition).
+	if hasProxies && !isBrowserMode(t.Mode) {
 		return "until blocked"
 	}
 	n := rc.Requests
@@ -432,6 +434,11 @@ func targetMode(t cfgdb.Target, rc cfgdb.Config, hasProxies bool) string {
 		n = 100
 	}
 	return fmt.Sprintf("%d req (default)", n)
+}
+
+// isBrowserMode reports whether a target runs through the browser executor.
+func isBrowserMode(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "browser")
 }
 
 // produceTarget feeds one target's jobs into its channel: a fixed per-URL count,
@@ -444,16 +451,20 @@ func produceTarget(ctx context.Context, wp *pool.Pool, t cfgdb.Target, rc cfgdb.
 		return pool.Job{URL: t.URL, Mode: t.Mode, Method: t.Method, Params: t.Params}
 	}
 
-	if t.Requests <= 0 && hasProxies {
+	// "Until blocked" (requests=0 with proxies) applies to http targets only.
+	// Browser targets are always finite: they can fall back to a direct run, so
+	// there is no proxy-exhaustion stop condition and an unbounded loop would just
+	// launch browsers forever. A browser target with requests<=0 uses the global
+	// default count instead.
+	if t.Requests <= 0 && hasProxies && !isBrowserMode(t.Mode) {
 		domain := []string{t.URL}
-		browserMode := strings.EqualFold(strings.TrimSpace(t.Mode), "browser")
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			if !wp.AnyUsable(ctx, domain, browserMode) {
+			if !wp.AnyUsable(ctx, domain, false) {
 				return
 			}
 			select {
