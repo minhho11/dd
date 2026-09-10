@@ -47,58 +47,111 @@ type Outcome struct {
 // per call so each run is isolated (fresh cookies/storage) and can use its own
 // proxy — the proxy is a browser-level setting, so proxy rotation needs a new
 // process. Any step error (including a failed assertion) stops the flow and is
-// returned in Outcome.Err; the browser is always torn down before returning.
+// returned in Outcome.Err; the browser is always torn down before returning. For
+// repeated direct runs, a Runner reuses one browser instead (see runner.go).
 func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, opts Options) Outcome {
-	stepTimeout := opts.Timeout
-	if stepTimeout <= 0 {
-		stepTimeout = 30 * time.Second
-	}
+	stepTimeout := normalizeTimeout(opts.Timeout)
 
-	// Copy the default options (never append into the package-global slice) and add
-	// ours: headless toggle, proxy, TLS, user-agent.
-	allocOpts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
-	allocOpts = append(allocOpts, chromedp.Flag("headless", opts.Headless))
-	if opts.Insecure {
-		allocOpts = append(allocOpts, chromedp.IgnoreCertErrors)
-	}
-	if opts.UserAgent != "" {
-		allocOpts = append(allocOpts, chromedp.UserAgent(opts.UserAgent))
-	}
-	proxyAddr, proxyUser, proxyPass := splitProxy(proxyURL)
-	if proxyAddr != "" {
-		allocOpts = append(allocOpts, chromedp.ProxyServer(proxyAddr))
-	}
-
+	allocOpts, user, pass := buildAllocOptions(opts, proxyURL)
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(ctx, allocOpts...)
 	defer cancelAlloc()
 	taskCtx, cancelTask := chromedp.NewContext(allocCtx)
 	defer cancelTask()
+
+	status := newStatusHolder()
+	listen(taskCtx, status, user, pass)
+	if err := enableDomains(taskCtx, user != ""); err != nil {
+		return Outcome{Err: fmt.Errorf("start browser: %w", err), Transport: true}
+	}
 
 	// Overall guard so a wedged browser can't hang the worker forever.
 	overall := stepTimeout * time.Duration(len(flow.Steps)+2)
 	runCtx, cancelRun := context.WithTimeout(taskCtx, overall)
 	defer cancelRun()
 
-	// Observe the main document's HTTP status, and — when the proxy needs auth —
-	// answer the proxy auth challenge (Chrome's --proxy-server takes no credentials,
-	// so they must be provided over the Fetch domain).
-	var (
-		mu        sync.Mutex
-		docStatus int
+	logf := logfOrNoop(opts.Logf)
+	out := runFlow(runCtx, entryURL, flow, stepTimeout, logf)
+	out.Status = status.get()
+	holdOpen(runCtx, opts.HoldOpen, logf)
+	return out
+}
+
+// normalizeTimeout returns the per-step timeout, defaulting to 30s.
+func normalizeTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 30 * time.Second
+	}
+	return d
+}
+
+func logfOrNoop(f func(string, ...any)) func(string, ...any) {
+	if f == nil {
+		return func(string, ...any) {}
+	}
+	return f
+}
+
+// buildAllocOptions assembles the chromedp exec-allocator options for opts and an
+// optional proxy, and returns the proxy credentials (empty when none) so the caller
+// can answer a proxy auth challenge.
+func buildAllocOptions(opts Options, proxyURL string) (allocOpts []chromedp.ExecAllocatorOption, user, pass string) {
+	// Copy the default options (never append into the package-global slice).
+	allocOpts = append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
+	allocOpts = append(allocOpts, chromedp.Flag("headless", opts.Headless))
+	// CPU/memory-reducing flags: forms don't need images, GPU, audio, or Chrome's
+	// background machinery, and these cut the cost of each launch substantially.
+	allocOpts = append(allocOpts,
+		chromedp.Flag("blink-settings", "imagesEnabled=false"),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("disable-software-rasterizer", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("mute-audio", true),
+		chromedp.Flag("disable-background-networking", true),
+		chromedp.Flag("disable-background-timer-throttling", true),
+		chromedp.Flag("disable-renderer-backgrounding", true),
+		chromedp.Flag("disable-extensions", true),
 	)
+	if opts.Insecure {
+		allocOpts = append(allocOpts, chromedp.IgnoreCertErrors)
+	}
+	if opts.UserAgent != "" {
+		allocOpts = append(allocOpts, chromedp.UserAgent(opts.UserAgent))
+	}
+	proxyAddr, u, p := splitProxy(proxyURL)
+	if proxyAddr != "" {
+		allocOpts = append(allocOpts, chromedp.ProxyServer(proxyAddr))
+	}
+	return allocOpts, u, p
+}
+
+// statusHolder records the latest main-document HTTP status, safe for concurrent
+// updates from the CDP event listener.
+type statusHolder struct {
+	mu     sync.Mutex
+	status int
+}
+
+func newStatusHolder() *statusHolder { return &statusHolder{} }
+
+func (h *statusHolder) set(s int) { h.mu.Lock(); h.status = s; h.mu.Unlock() }
+func (h *statusHolder) get() int  { h.mu.Lock(); defer h.mu.Unlock(); return h.status }
+func (h *statusHolder) reset()    { h.set(0) }
+
+// listen wires the CDP event handlers on taskCtx: capture the main document's HTTP
+// status, and answer proxy auth challenges (Chrome's --proxy-server takes no
+// credentials, so they go over the Fetch domain).
+func listen(taskCtx context.Context, status *statusHolder, user, pass string) {
 	chromedp.ListenTarget(taskCtx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *network.EventResponseReceived:
 			if e.Type == network.ResourceTypeDocument && e.Response != nil {
-				mu.Lock()
-				docStatus = int(e.Response.Status)
-				mu.Unlock()
+				status.set(int(e.Response.Status))
 			}
 		case *fetch.EventAuthRequired:
 			resp := &fetch.AuthChallengeResponse{
 				Response: fetch.AuthChallengeResponseResponseProvideCredentials,
-				Username: proxyUser,
-				Password: proxyPass,
+				Username: user,
+				Password: pass,
 			}
 			go func() { _ = chromedp.Run(taskCtx, fetch.ContinueWithAuth(e.RequestID, resp)) }()
 		case *fetch.EventRequestPaused:
@@ -107,20 +160,24 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 			go func() { _ = chromedp.Run(taskCtx, fetch.ContinueRequest(e.RequestID)) }()
 		}
 	})
+}
 
+// enableDomains turns on the CDP Network domain (for status capture) and, when the
+// proxy needs auth, the Fetch domain with auth handling.
+func enableDomains(taskCtx context.Context, needAuth bool) error {
 	enable := []chromedp.Action{network.Enable()}
-	if proxyUser != "" {
+	if needAuth {
 		enable = append(enable, fetch.Enable().WithHandleAuthRequests(true))
 	}
-	if err := chromedp.Run(taskCtx, enable...); err != nil {
-		return Outcome{Err: fmt.Errorf("start browser: %w", err)}
-	}
+	return chromedp.Run(taskCtx, enable...)
+}
 
+// runFlow navigates the entry URL and runs each step on the given chromedp context
+// (which must already have a browser + enabled domains). It fills every Outcome
+// field except Status (the caller sets that from its statusHolder). Shared by
+// Execute (fresh browser) and a reused Runner session.
+func runFlow(runCtx context.Context, entryURL string, flow Flow, stepTimeout time.Duration, logf func(string, ...any)) Outcome {
 	out := Outcome{}
-	logf := opts.Logf
-	if logf == nil {
-		logf = func(string, ...any) {}
-	}
 
 	// Resolve flow variables once for this run so fields that reference the same
 	// {{name}} (e.g. password + confirm) get one shared value.
@@ -133,8 +190,6 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 			out.Transport = true // failing to load the entry page is a connection issue
 			logf("navigate %s → FAIL: %v", entryURL, err)
 			captureState(runCtx, &out)
-			out.Status = readStatus(&mu, &docStatus)
-			holdOpen(runCtx, opts.HoldOpen, logf)
 			return out
 		}
 		out.Steps++
@@ -167,8 +222,6 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 	}
 
 	captureState(runCtx, &out)
-	out.Status = readStatus(&mu, &docStatus)
-	holdOpen(runCtx, opts.HoldOpen, logf)
 	return out
 }
 
@@ -185,12 +238,6 @@ func holdOpen(ctx context.Context, d time.Duration, logf func(string, ...any)) {
 	case <-ctx.Done():
 	case <-t.C:
 	}
-}
-
-func readStatus(mu *sync.Mutex, status *int) int {
-	mu.Lock()
-	defer mu.Unlock()
-	return *status
 }
 
 // runAction runs a single chromedp action under its own timeout.

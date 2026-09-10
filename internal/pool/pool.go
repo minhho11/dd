@@ -106,6 +106,17 @@ type Options struct {
 	// step (ok/FAIL) during the run. Toggled from the config table (browser_debug).
 	BrowserDebug bool
 	BrowserLog   func(format string, args ...any)
+
+	// BrowserMax caps how many browser (Chromium) flows run concurrently across all
+	// workers; <=0 = unlimited. Each browser flow launches a Chromium, which is
+	// CPU-heavy, so this bounds CPU independently of the worker count.
+	BrowserMax int
+
+	// BrowserReuse reuses one browser across many direct flow runs (cookies cleared
+	// between runs) instead of launching a fresh Chromium per request — far cheaper
+	// on CPU. Proxied browser jobs always use a fresh browser (proxy is a
+	// browser-level setting).
+	BrowserReuse bool
 }
 
 // Summary aggregates results after a run.
@@ -175,6 +186,10 @@ type Pool struct {
 	browser      browser.Options // browser-mode execution options
 	browserDebug bool
 	browserLog   func(format string, args ...any)
+	browserSem   chan struct{} // bounds concurrent browser flows; nil = unlimited
+	browserReuse bool
+	runnerOnce   sync.Once
+	runner       *browser.Runner // reusable direct-browser sessions; lazily created
 	// OnResult, if set, is called for every final result (concurrently). It must
 	// be safe for concurrent use.
 	OnResult func(Result)
@@ -211,7 +226,18 @@ func New(clients *httpclient.Pool, blocks BlockStore, opts Options) *Pool {
 		},
 		browserDebug: opts.BrowserDebug,
 		browserLog:   opts.BrowserLog,
+		browserSem:   newSem(opts.BrowserMax),
+		browserReuse: opts.BrowserReuse,
 	}
+}
+
+// newSem returns a buffered channel of size n used as a counting semaphore, or nil
+// when n<=0 (unlimited).
+func newSem(n int) chan struct{} {
+	if n <= 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
 }
 
 // Run consumes jobs until the channel is closed or ctx is cancelled and returns
@@ -394,6 +420,24 @@ func isSOCKS(proxyURL string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(proxyURL)), "socks")
 }
 
+// browserRunner lazily creates the reusable-browser runner, parented to ctx (the
+// run context) so its browsers are torn down when the run ends. CloseBrowser also
+// tears them down explicitly after the workers stop.
+func (p *Pool) browserRunner(ctx context.Context) *browser.Runner {
+	p.runnerOnce.Do(func() {
+		p.runner = browser.NewRunner(ctx, p.browser)
+	})
+	return p.runner
+}
+
+// CloseBrowser tears down any reused browser sessions. Call it after the run's
+// workers have stopped (RunGroups returned).
+func (p *Pool) CloseBrowser() {
+	if p.runner != nil {
+		p.runner.Close()
+	}
+}
+
 // fireBrowser runs a browser-mode job: it executes the flow (params) against the
 // target through the picked proxy in a headless Chromium, then classifies and
 // feeds the outcome back into health and the block store like fire does. A blocked
@@ -415,18 +459,39 @@ func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job J
 		return res
 	}
 
-	opts := p.browser
+	// Cap concurrent Chromium instances (each is CPU-heavy) independently of the
+	// worker count. Workers over the cap block here until a slot frees up.
+	if p.browserSem != nil {
+		select {
+		case <-ctx.Done():
+			res.Err = ctx.Err()
+			return res
+		case p.browserSem <- struct{}{}:
+			defer func() { <-p.browserSem }()
+		}
+	}
+
+	var logf func(string, ...any)
 	if p.browserDebug && p.browserLog != nil {
 		via := "direct"
 		if client.ProxyURL != "" {
 			via = client.ProxyURL
 		}
 		prefix := fmt.Sprintf("[browser %s via %s]", job.URL, via)
-		opts.Logf = func(f string, a ...any) { p.browserLog(prefix+" "+f, a...) }
+		logf = func(f string, a ...any) { p.browserLog(prefix+" "+f, a...) }
 	}
 
 	start := time.Now()
-	oc := browser.Execute(ctx, job.URL, flow, client.ProxyURL, opts)
+	var oc browser.Outcome
+	if client.Direct() && p.browserReuse {
+		// Reuse one browser across direct runs (cookies cleared each run) instead of
+		// launching a fresh Chromium per request.
+		oc = p.browserRunner(ctx).Run(job.URL, flow, logf)
+	} else {
+		opts := p.browser
+		opts.Logf = logf
+		oc = browser.Execute(ctx, job.URL, flow, client.ProxyURL, opts)
+	}
 	res.Latency = time.Since(start)
 	res.StatusCode = oc.Status
 	res.Err = oc.Err

@@ -95,7 +95,22 @@ target with `requests<=0` uses the global default count), since a direct fallbac
 no proxy-exhaustion stop condition. **Per-step debug logging** is
 toggled by the `browser_debug` config key (seed flag `-browser-debug`): when on, each
 browser navigation/step logs ok/FAIL during the run (`pool.fireBrowser` builds a
-prefixed `browser.Options.Logf`); flip it live in the `config` table. Example:
+prefixed `browser.Options.Logf`); flip it live in the `config` table. **Concurrency
+cap:** each browser flow launches a full Chromium (CPU-heavy), so `browser_max` config
+key (seed `-browser-max`, default 2, 0=unlimited) bounds how many run at once via a
+semaphore in `pool.fireBrowser`, independent of worker allocation — workers over the
+cap block until a slot frees. `browser.Execute` also sets CPU/memory-reducing Chrome
+flags (images off, GPU/audio/background machinery disabled). **Browser reuse:** with
+`browser_reuse` (seed `-browser-reuse`, default true), **direct** browser jobs reuse
+one long-lived Chromium across runs (`browser.Runner`/`session` in `runner.go`, lazily
+created via `Pool.browserRunner`, torn down by `Pool.CloseBrowser` after the run) —
+cookies are cleared before each run so each submission starts fresh — instead of
+launching a process per request (the dominant CPU cost). Proxied browser jobs always
+use a fresh browser (`browser.Execute`), since the proxy is a browser-level setting.
+`browser.go` factors the shared launch/flow logic (`buildAllocOptions`, `listen`,
+`enableDomains`, `runFlow`, `statusHolder`) so both paths share it. Config keys are additive:
+`EnsureDefault` seeds any *missing* key on startup (ON CONFLICT DO NOTHING), so new
+keys like `browser_max` appear in an already-seeded `config` table on upgrade. Example:
 `{"steps":[{"action":"fill","selector":"#email","value":"{{randEmail}}"},{"action":"fill","selector":"#pass","value":"{{randString:12}}"},{"action":"click","selector":"button[type=submit]"},{"action":"waitVisible","selector":".dashboard"},{"action":"assertText","selector":".welcome","contains":"Welcome"}]}`
 
 **Manual confirm (`-browser-test URL`):** runs one target's browser flow **once** and

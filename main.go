@@ -65,6 +65,8 @@ type config struct {
 	reportInterval time.Duration
 	headless       bool
 	browserDebug   bool // seed: log each browser step during the run (config: browser_debug)
+	browserMax     int  // seed: max concurrent browser flows (config: browser_max)
+	browserReuse   bool // seed: reuse one browser across direct runs (config: browser_reuse)
 
 	browserTest      string        // one-shot: run this URL's browser flow once and exit
 	browserTestProxy string        // optional proxy for the one-shot test ("" = direct)
@@ -239,6 +241,8 @@ func cliRunConfig(cfg config) cfgdb.Config {
 		UserAgent:      cfg.userAgent,
 		Insecure:       cfg.insecure,
 		BrowserDebug:   cfg.browserDebug,
+		BrowserMax:     cfg.browserMax,
+		BrowserReuse:   cfg.browserReuse,
 	}
 }
 
@@ -388,6 +392,8 @@ func executeOneRun(ctx context.Context, out io.Writer, rc cfgdb.Config, targets 
 		UserAgent:      rc.UserAgent,
 		BrowserDebug:   rc.BrowserDebug,
 		BrowserLog:     func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
+		BrowserMax:     rc.BrowserMax,
+		BrowserReuse:   rc.BrowserReuse,
 	})
 	wp.OnResult = onResult
 
@@ -416,7 +422,9 @@ func executeOneRun(ctx context.Context, out io.Writer, rc cfgdb.Config, targets 
 		go produceTarget(ctx, wp, t, rc, hasProxies, jobs)
 		groups[i] = pool.Group{Workers: alloc[i], Jobs: jobs}
 	}
-	return wp.RunGroups(ctx, groups)
+	summary := wp.RunGroups(ctx, groups)
+	wp.CloseBrowser() // tear down any reused browser sessions before the next run
+	return summary
 }
 
 // targetMode describes how many requests a target will fire, for the run banner.
@@ -580,6 +588,8 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	reportInterval := fs.Duration("report-interval", 30*time.Second, "how often to upsert per-URL success/fail into the `report` table (<=0 uses 30s)")
 	headless := fs.Bool("headless", true, "run browser-mode (mode='browser') targets in headless Chromium; set false to watch")
 	browserDebug := fs.Bool("browser-debug", false, "seed: log each browser navigation/step during the run (toggle live via config.browser_debug)")
+	browserMax := fs.Int("browser-max", 2, "seed: max concurrent browser (Chromium) flows across all workers, 0=unlimited (tune live via config.browser_max)")
+	browserReuse := fs.Bool("browser-reuse", true, "seed: reuse one browser across direct flow runs instead of relaunching per request (toggle live via config.browser_reuse)")
 	browserTest := fs.String("browser-test", "", "run the browser flow for this urls.url once and exit (manual confirm); pairs with -headless=false")
 	browserTestProxy := fs.String("browser-test-proxy", "", "proxy URL to route the -browser-test run through (default direct)")
 	browserTestHold := fs.Duration("browser-test-hold", 0, "keep the browser open this long after a -browser-test run (e.g. 30s) to inspect it")
@@ -615,6 +625,8 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		reportInterval:   *reportInterval,
 		headless:         *headless,
 		browserDebug:     *browserDebug,
+		browserMax:       *browserMax,
+		browserReuse:     *browserReuse,
 		browserTest:      *browserTest,
 		browserTestProxy: *browserTestProxy,
 		browserTestHold:  *browserTestHold,

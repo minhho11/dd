@@ -43,6 +43,8 @@ type Config struct {
 	UserAgent      string
 	Insecure       bool
 	BrowserDebug   bool
+	BrowserMax     int  // max concurrent browser (Chromium) flows; <=0 = unlimited
+	BrowserReuse   bool // reuse one browser across direct flow runs instead of relaunching
 }
 
 // config keys, stable across versions.
@@ -58,6 +60,8 @@ const (
 	keyUserAgent      = "user_agent"
 	keyInsecure       = "insecure"
 	keyBrowserDebug   = "browser_debug"
+	keyBrowserMax     = "browser_max"
+	keyBrowserReuse   = "browser_reuse"
 )
 
 // Timeout returns the per-request timeout.
@@ -77,6 +81,8 @@ func (c Config) toSettings() []Setting {
 		{Key: keyUserAgent, Value: c.UserAgent},
 		{Key: keyInsecure, Value: strconv.FormatBool(c.Insecure)},
 		{Key: keyBrowserDebug, Value: strconv.FormatBool(c.BrowserDebug)},
+		{Key: keyBrowserMax, Value: strconv.Itoa(c.BrowserMax)},
+		{Key: keyBrowserReuse, Value: strconv.FormatBool(c.BrowserReuse)},
 	}
 }
 
@@ -98,6 +104,8 @@ func configFromSettings(kv map[string]string) Config {
 		UserAgent:      kv[keyUserAgent],
 		Insecure:       atob(kv[keyInsecure]),
 		BrowserDebug:   atob(kv[keyBrowserDebug]),
+		BrowserMax:     atoi(kv[keyBrowserMax]),
+		BrowserReuse:   atob(kv[keyBrowserReuse]),
 	}
 }
 
@@ -131,19 +139,14 @@ func (r *Repo) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
-// EnsureDefault seeds the key/value rows from def if the table is empty. An
-// existing (non-empty) config is left untouched — the DB is the source of truth
-// once seeded.
+// EnsureDefault seeds the key/value rows from def, inserting only keys that are
+// missing (ON CONFLICT DO NOTHING): the CLI defaults populate a fresh table on
+// first run, and any *new* keys added in a later version get seeded on the next
+// startup, while existing rows keep their values (the DB stays the source of truth
+// for anything already set).
 func (r *Repo) EnsureDefault(ctx context.Context, def Config) error {
-	n, err := r.db.NewSelect().Model((*Setting)(nil)).Count(ctx)
-	if err != nil {
-		return err
-	}
-	if n > 0 {
-		return nil
-	}
 	rows := def.toSettings()
-	_, err = r.db.NewInsert().Model(&rows).On("CONFLICT (key) DO NOTHING").Exec(ctx)
+	_, err := r.db.NewInsert().Model(&rows).On("CONFLICT (key) DO NOTHING").Exec(ctx)
 	return err
 }
 
