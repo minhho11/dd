@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,20 +94,59 @@ func TestStepAction(t *testing.T) {
 	}
 	for _, action := range known {
 		s := Step{Action: action, Selector: "#x", Value: "v", URL: "https://a", Contains: "y"}
-		if _, err := stepAction(s); err != nil {
+		if _, err := stepAction(s, nil); err != nil {
 			t.Errorf("stepAction(%q) errored: %v", action, err)
 		}
 	}
 
 	t.Run("unknown action errors", func(t *testing.T) {
-		if _, err := stepAction(Step{Action: "frobnicate"}); err == nil {
+		if _, err := stepAction(Step{Action: "frobnicate"}, nil); err == nil {
 			t.Error("want error for unknown action")
 		}
 	})
 
 	t.Run("navigate without url errors", func(t *testing.T) {
-		if _, err := stepAction(Step{Action: "navigate"}); err == nil {
+		if _, err := stepAction(Step{Action: "navigate"}, nil); err == nil {
 			t.Error("want error for navigate with no url")
+		}
+	})
+}
+
+func TestVars(t *testing.T) {
+	t.Run("resolveVars expands once", func(t *testing.T) {
+		got := resolveVars(map[string]string{"pw": "{{randString:12}}", "lit": "hello"})
+		if len(got["pw"]) != 12 {
+			t.Errorf("pw = %q, want 12 chars", got["pw"])
+		}
+		if got["lit"] != "hello" {
+			t.Errorf("lit = %q, want hello", got["lit"])
+		}
+	})
+
+	t.Run("same var reference yields identical value across fields", func(t *testing.T) {
+		vars := resolveVars(map[string]string{"pw": "{{randString:16}}"})
+		a := expandValue("{{pw}}", vars)
+		b := expandValue("{{pw}}", vars)
+		if a == "" || a != b {
+			t.Errorf("password/confirm mismatch: %q vs %q", a, b)
+		}
+	})
+
+	t.Run("generators still expand alongside vars", func(t *testing.T) {
+		vars := resolveVars(map[string]string{"pw": "{{randString:8}}"})
+		got := expandValue(`{"password":"{{pw}}","token":"{{uuid}}"}`, vars)
+		if strings.Contains(got, "{{") {
+			t.Errorf("unexpanded token left: %q", got)
+		}
+	})
+
+	t.Run("flow parses vars", func(t *testing.T) {
+		f, err := ParseFlow(`{"vars":{"pw":"{{randString:12}}"},"steps":[{"action":"fill","selector":"#p","value":"{{pw}}"}]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.Vars["pw"] == "" {
+			t.Error("vars not parsed")
 		}
 	})
 }

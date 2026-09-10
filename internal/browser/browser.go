@@ -111,6 +111,10 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 
 	out := Outcome{}
 
+	// Resolve flow variables once for this run so fields that reference the same
+	// {{name}} (e.g. password + confirm) get one shared value.
+	vars := resolveVars(flow.Vars)
+
 	// Navigate the entry URL first, then run each step in order.
 	if entryURL != "" {
 		if err := runAction(runCtx, stepTimeout, chromedp.Navigate(tmpl.Expand(entryURL))); err != nil {
@@ -124,7 +128,7 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 	}
 
 	for i, s := range flow.Steps {
-		act, err := stepAction(s)
+		act, err := stepAction(s, vars)
 		if err != nil {
 			out.Err = fmt.Errorf("step %d: %w", i+1, err)
 			break
@@ -163,14 +167,15 @@ func runAction(ctx context.Context, d time.Duration, a chromedp.Action) error {
 	return chromedp.Run(c, a)
 }
 
-// stepAction maps one Step to a chromedp action. Values and URLs are expanded
-// through internal/tmpl so each run gets fresh random data.
-func stepAction(s Step) (chromedp.Action, error) {
+// stepAction maps one Step to a chromedp action. Values and URLs are resolved
+// against the flow vars and then expanded through internal/tmpl, so each run gets
+// fresh random data and repeated {{name}} references share one value.
+func stepAction(s Step, vars map[string]string) (chromedp.Action, error) {
 	sel := s.Selector
-	val := tmpl.Expand(s.Value)
+	val := expandValue(s.Value, vars)
 	switch strings.ToLower(strings.TrimSpace(s.Action)) {
 	case "navigate", "goto":
-		u := tmpl.Expand(s.URL)
+		u := expandValue(s.URL, vars)
 		if u == "" {
 			u = val
 		}
@@ -195,10 +200,44 @@ func stepAction(s Step) (chromedp.Action, error) {
 	case "sleep", "wait":
 		return chromedp.Sleep(parseDur(s.Value)), nil
 	case "asserttext":
-		return assertTextAction(sel, s.Contains), nil
+		// contains is matched literally, but may reference a var so an assertion can
+		// check the value a field was filled with; no generator expansion.
+		return assertTextAction(sel, substituteVars(s.Contains, vars)), nil
 	default:
 		return nil, fmt.Errorf("unknown action %q", s.Action)
 	}
+}
+
+// resolveVars expands each flow variable's value once (through internal/tmpl), so
+// {"pw":"{{randString:12}}"} yields one random string reused for the whole run.
+func resolveVars(vars map[string]string) map[string]string {
+	if len(vars) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(vars))
+	for name, raw := range vars {
+		out[name] = tmpl.Expand(raw)
+	}
+	return out
+}
+
+// expandValue substitutes {{name}} var references, then expands any remaining
+// {{...}} generators. Var substitution runs first so a var value is used verbatim
+// (and generator names never shadow a var).
+func expandValue(s string, vars map[string]string) string {
+	return tmpl.Expand(substituteVars(s, vars))
+}
+
+// substituteVars replaces {{name}} with the resolved value for each var name.
+// Unknown tokens (generators, typos) are left for tmpl.Expand / visibility.
+func substituteVars(s string, vars map[string]string) string {
+	if len(vars) == 0 || !strings.Contains(s, "{{") {
+		return s
+	}
+	for name, val := range vars {
+		s = strings.ReplaceAll(s, "{{"+name+"}}", val)
+	}
+	return s
 }
 
 // isNavStep reports whether an action loads a page (so a failure is a connection

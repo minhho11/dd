@@ -39,9 +39,15 @@ type Step struct {
 	Timeout  string `json:"timeout,omitempty"`
 }
 
-// Flow is an ordered list of steps, decoded from a target's params JSON.
+// Flow is an ordered list of steps, decoded from a target's params JSON. Vars are
+// named values generated once per run and referenced from step values as
+// {{name}}, so several fields can share one value — e.g. a password and its
+// confirmation. Each var's value is itself expanded through internal/tmpl once at
+// the start of the run (so {"pw":"{{randString:12}}"} picks one random string for
+// the whole flow), then substituted wherever {{pw}} appears.
 type Flow struct {
-	Steps []Step `json:"steps"`
+	Vars  map[string]string `json:"vars,omitempty"`
+	Steps []Step            `json:"steps"`
 }
 
 // ParseFlow decodes a browser flow from a target's params string, which must be a

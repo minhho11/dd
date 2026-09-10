@@ -73,7 +73,11 @@ runs in order; any step error (including a failed assertion) fails the run. Acti
 `waitVisible`/`waitReady`/`assertVisible` (`selector`), `assertText`
 (`selector`,`contains`), `sleep`/`wait` (`value` duration, e.g. `"500ms"`). Selectors
 are CSS (ByQuery). `value`/`url` support the same `{{...}}` generators (expanded per
-run); `contains` is literal. Optional per-step `timeout` (Go duration) overrides the
+run); `contains` is literal. An optional top-level `"vars"` object holds values
+generated **once per run** and referenced from step values as `{{name}}`, so
+several fields can share one value (e.g. password + confirm):
+`{"vars":{"pw":"{{randString:12}}"},"steps":[{"action":"fill","selector":"#password","value":"{{pw}}"},{"action":"fill","selector":"#confirm","value":"{{pw}}"}]}`.
+Optional per-step `timeout` (Go duration) overrides the
 default (`-timeout`). Authenticated proxies work — credentials are answered over the
 CDP Fetch domain since Chrome's `--proxy-server` takes none. Blocks are detected the
 same way as http (status 403/429/503, body challenge markers, or a block URL); a
