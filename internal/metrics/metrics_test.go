@@ -21,32 +21,32 @@ func TestRecordAndTotals(t *testing.T) {
 	}
 }
 
-func TestDeltaResetsPerInterval(t *testing.T) {
+func TestSnapshotEmitsCumulative(t *testing.T) {
 	m := New()
 	m.Record("a.com", true)
 	m.Record("a.com", false)
 
-	// First interval: the delta reflects everything so far.
-	rows := m.delta(time.Now())
+	// First flush: the snapshot reflects the cumulative totals so far.
+	rows := m.snapshot(time.Now())
 	got := map[string][2]int64{}
 	for _, r := range rows {
 		got[r.URL] = [2]int64{r.Success, r.Fail}
 	}
 	if got["a.com"] != [2]int64{1, 1} {
-		t.Fatalf("first delta a.com = %v, want [1 1]", got["a.com"])
+		t.Fatalf("first snapshot a.com = %v, want [1 1]", got["a.com"])
 	}
 
-	// No new activity -> no rows.
-	if rows := m.delta(time.Now()); len(rows) != 0 {
+	// No new activity -> nothing to re-write.
+	if rows := m.snapshot(time.Now()); len(rows) != 0 {
 		t.Errorf("expected no rows with no new activity, got %d", len(rows))
 	}
 
-	// New activity -> only the new delta, not cumulative.
+	// New activity -> the row carries the new cumulative totals, not the delta.
 	m.Record("a.com", true)
 	m.Record("a.com", true)
-	rows = m.delta(time.Now())
-	if len(rows) != 1 || rows[0].Success != 2 || rows[0].Fail != 0 {
-		t.Errorf("second delta = %+v, want success=2 fail=0", rows)
+	rows = m.snapshot(time.Now())
+	if len(rows) != 1 || rows[0].Success != 3 || rows[0].Fail != 1 {
+		t.Errorf("second snapshot = %+v, want success=3 fail=1", rows)
 	}
 
 	// Cumulative totals remain intact in the in-memory variable.

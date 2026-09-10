@@ -1,5 +1,6 @@
 // Package metrics keeps an in-memory per-URL success/fail tally and periodically
-// flushes each interval's deltas to the `report` table in Postgres.
+// upserts each URL's cumulative totals into a single per-URL row in the `report`
+// table in Postgres, updating that one row every interval.
 package metrics
 
 import (
@@ -12,15 +13,16 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// Report is one interval's success/fail tally for a single URL.
+// Report is the single, live row for a single URL: its cumulative success/fail
+// tally, updated in place each interval. URL is the primary key, so there is
+// exactly one row per URL.
 type Report struct {
 	bun.BaseModel `bun:"table:report,alias:rpt"`
 
-	ID        int64     `bun:"id,pk,autoincrement" json:"id"`
-	URL       string    `bun:"url,notnull" json:"url"`
+	URL       string    `bun:"url,pk" json:"url"`
 	Success   int64     `bun:"success,notnull" json:"success"`
 	Fail      int64     `bun:"fail,notnull" json:"fail"`
-	CreatedAt time.Time `bun:"created_at,notnull" json:"created_at"`
+	UpdatedAt time.Time `bun:"updated_at,notnull" json:"updated_at"`
 }
 
 // Repo persists Report rows.
@@ -37,17 +39,24 @@ func (r *Repo) EnsureSchema(ctx context.Context) error {
 	return err
 }
 
-// InsertBatch inserts the rows in one statement.
-func (r *Repo) InsertBatch(ctx context.Context, rows []Report) error {
+// Upsert writes each URL's cumulative row, updating the existing row in place on
+// a URL conflict, in one statement. This keeps one row per URL that advances over
+// time rather than appending a new row per interval.
+func (r *Repo) Upsert(ctx context.Context, rows []Report) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	_, err := r.db.NewInsert().Model(&rows).Exec(ctx)
+	_, err := r.db.NewInsert().Model(&rows).
+		On("CONFLICT (url) DO UPDATE").
+		Set("success = EXCLUDED.success").
+		Set("fail = EXCLUDED.fail").
+		Set("updated_at = EXCLUDED.updated_at").
+		Exec(ctx)
 	return err
 }
 
 // counters holds the cumulative tallies plus the marks taken at the last flush,
-// so each flush can emit the delta for the interval.
+// so each flush can skip URLs that have not changed since it last wrote them.
 type counters struct {
 	success, fail         int64
 	lastSuccess, lastFail int64
@@ -91,18 +100,18 @@ func (m *Metrics) Totals() map[string][2]int64 {
 	return out
 }
 
-// delta drains the per-interval deltas into Report rows and advances the marks.
-func (m *Metrics) delta(now time.Time) []Report {
+// snapshot returns the cumulative Report row for each URL that has changed since
+// the last flush and advances the marks. Emitting cumulative totals (not deltas)
+// lets each URL keep a single row that is updated in place.
+func (m *Metrics) snapshot(now time.Time) []Report {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var rows []Report
 	for u, c := range m.perURL {
-		ds := c.success - c.lastSuccess
-		df := c.fail - c.lastFail
-		if ds == 0 && df == 0 {
+		if c.success == c.lastSuccess && c.fail == c.lastFail {
 			continue
 		}
-		rows = append(rows, Report{URL: u, Success: ds, Fail: df, CreatedAt: now})
+		rows = append(rows, Report{URL: u, Success: c.success, Fail: c.fail, UpdatedAt: now})
 		c.lastSuccess = c.success
 		c.lastFail = c.fail
 	}
@@ -110,18 +119,18 @@ func (m *Metrics) delta(now time.Time) []Report {
 }
 
 func (m *Metrics) flush(ctx context.Context, repo *Repo, out io.Writer) {
-	rows := m.delta(time.Now())
+	rows := m.snapshot(time.Now())
 	if len(rows) == 0 {
 		return
 	}
-	if err := repo.InsertBatch(ctx, rows); err != nil {
-		fmt.Fprintln(out, "report insert error:", err)
+	if err := repo.Upsert(ctx, rows); err != nil {
+		fmt.Fprintln(out, "report upsert error:", err)
 	}
 }
 
-// Run flushes each interval's per-URL deltas to the report table until ctx is
-// cancelled, then does a final flush (with a fresh context so it still writes
-// while shutting down).
+// Run upserts each URL's cumulative totals into its one report row every interval
+// until ctx is cancelled, then does a final flush (with a fresh context so it
+// still writes while shutting down).
 func (m *Metrics) Run(ctx context.Context, repo *Repo, interval time.Duration, out io.Writer) {
 	if interval <= 0 {
 		return

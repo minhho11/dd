@@ -1,76 +1,66 @@
 package main
 
-import (
-	"bytes"
-	"errors"
-	"log"
-	"reflect"
-	"strings"
-	"testing"
+import "testing"
 
-	"github.com/minhho11/dd/internal/pool"
-)
-
-func TestSplitList(t *testing.T) {
-	tests := []struct {
-		in   string
-		want []string
-	}{
-		{"aaa.com,xxx.vn", []string{"aaa.com", "xxx.vn"}},
-		{" a , b ,, c ", []string{"a", "b", "c"}},
-		{"", nil},
-		{"only.one", []string{"only.one"}},
+func sum(xs []int) int {
+	t := 0
+	for _, x := range xs {
+		t += x
 	}
-	for _, tt := range tests {
-		got := splitList(tt.in)
-		if len(got) == 0 && len(tt.want) == 0 {
-			continue
-		}
-		if !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("splitList(%q) = %v, want %v", tt.in, got, tt.want)
-		}
-	}
+	return t
 }
 
-func TestParseFlagsDefaults(t *testing.T) {
-	cfg, err := parseFlags(nil, nil)
-	if err != nil {
-		t.Fatalf("parseFlags: %v", err)
-	}
-	if cfg.workers != 10 {
-		t.Errorf("workers = %d, want 10", cfg.workers)
-	}
-	if cfg.requests != 100 {
-		t.Errorf("requests = %d, want 100", cfg.requests)
-	}
-	if !reflect.DeepEqual(cfg.urls, []string{"https://example.com"}) {
-		t.Errorf("urls = %v, want [https://example.com]", cfg.urls)
-	}
-}
+func TestAllocateWorkers(t *testing.T) {
+	t.Run("proportional split", func(t *testing.T) {
+		got := allocateWorkers([]float64{50, 30, 20}, 10)
+		want := []int{5, 3, 2}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("alloc = %v, want %v", got, want)
+			}
+		}
+		if sum(got) != 10 {
+			t.Errorf("total = %d, want 10", sum(got))
+		}
+	})
 
-func TestErrorLogHandler(t *testing.T) {
-	var buf bytes.Buffer
-	h := errorLogHandler(log.New(&buf, "", 0))
+	t.Run("relative weights normalize", func(t *testing.T) {
+		// 3:1 over 8 workers -> 6:2.
+		got := allocateWorkers([]float64{3, 1}, 8)
+		if got[0] != 6 || got[1] != 2 {
+			t.Errorf("alloc = %v, want [6 2]", got)
+		}
+	})
 
-	// Successful and blocked results are not errors -> nothing logged.
-	h(pool.Result{URL: "http://a.com", StatusCode: 200})
-	h(pool.Result{URL: "http://a.com", StatusCode: 403, Blocked: true})
-	if buf.Len() != 0 {
-		t.Fatalf("non-error results should not be logged, got: %q", buf.String())
-	}
+	t.Run("every target gets at least one worker", func(t *testing.T) {
+		got := allocateWorkers([]float64{1, 1, 1, 1}, 2) // fewer workers than targets
+		if len(got) != 4 || sum(got) != 4 {
+			t.Fatalf("alloc = %v, want four 1s", got)
+		}
+		for i, w := range got {
+			if w < 1 {
+				t.Errorf("target %d got %d workers, want >=1", i, w)
+			}
+		}
+	})
 
-	// Transport error and skip are logged.
-	h(pool.Result{URL: "http://a.com", ProxyURL: "http://p:1", Attempts: 3, Err: errors.New("connection refused")})
-	h(pool.Result{URL: "http://b.vn", Domain: "b.vn", Err: pool.ErrAllBlocked})
+	t.Run("remainder distributed, total preserved", func(t *testing.T) {
+		got := allocateWorkers([]float64{1, 1, 1}, 10)
+		if sum(got) != 10 {
+			t.Errorf("total = %d, want 10 (got %v)", sum(got), got)
+		}
+	})
 
-	out := buf.String()
-	if !strings.Contains(out, "request error") || !strings.Contains(out, "connection refused") {
-		t.Errorf("missing transport error line: %q", out)
-	}
-	if !strings.Contains(out, "skipped") || !strings.Contains(out, "b.vn") {
-		t.Errorf("missing skip line: %q", out)
-	}
-	if lines := strings.Count(strings.TrimSpace(out), "\n"); lines != 1 { // 2 lines -> 1 newline between
-		t.Errorf("expected exactly 2 logged lines, got %d newlines: %q", lines, out)
-	}
+	t.Run("zero weights fall back to equal split", func(t *testing.T) {
+		got := allocateWorkers([]float64{0, 0}, 4)
+		if got[0] != 2 || got[1] != 2 {
+			t.Errorf("alloc = %v, want [2 2]", got)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		if got := allocateWorkers(nil, 10); got != nil {
+			t.Errorf("alloc = %v, want nil", got)
+		}
+	})
 }

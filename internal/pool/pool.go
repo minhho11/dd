@@ -15,7 +15,9 @@ import (
 	"github.com/go-resty/resty/v2"
 	"golang.org/x/time/rate"
 
+	"github.com/minhho11/dd/internal/browser"
 	"github.com/minhho11/dd/internal/httpclient"
+	"github.com/minhho11/dd/internal/tmpl"
 )
 
 // ErrAllBlocked is returned as a Result.Err when every proxy is unavailable
@@ -52,9 +54,18 @@ type BlockStore interface {
 	OnSuccess(ctx context.Context, proxyID int64, domain string) error
 }
 
-// Job is a single unit of work: one HTTP GET against URL.
+// Job is a single unit of work. Mode selects the executor:
+//
+//   - "" or "http":  one HTTP request against URL. Method defaults to GET; Params
+//     is a JSON object sent as the query string for GET/HEAD/DELETE and as the
+//     request body for POST/PUT/PATCH.
+//   - "browser":     a scripted Chromium flow against URL. Params is a
+//     {"steps":[...]} JSON flow (see internal/browser); Method is ignored.
 type Job struct {
-	URL string
+	URL    string
+	Mode   string
+	Method string
+	Params string
 }
 
 // Result records the final outcome of one Job (after any retries).
@@ -67,6 +78,11 @@ type Result struct {
 	Attempts   int  // HTTP requests made for this job (1 + retries)
 	Latency    time.Duration
 	Err        error
+
+	// retry reports whether this attempt is worth retrying through another proxy.
+	// Set by fire/fireBrowser; consumed by do via retryable. Unexported: it is an
+	// internal control signal, not part of the reported result.
+	retry bool
 }
 
 // Options configures a Pool.
@@ -78,6 +94,12 @@ type Options struct {
 	ProxyCooldown  time.Duration // how long an unhealthy proxy is skipped
 	CacheBust      bool          // append a unique query param to each request
 	CacheBustParam string        // the param name (default "_")
+
+	// Browser-mode options (mode='browser' jobs), forwarded to internal/browser.
+	Headless       bool          // run Chromium headless
+	BrowserTimeout time.Duration // per-step/navigation timeout for browser flows
+	Insecure       bool          // ignore TLS cert errors in the browser
+	UserAgent      string        // override the browser User-Agent when non-empty
 }
 
 // Summary aggregates results after a run.
@@ -144,6 +166,7 @@ type Pool struct {
 	health    *health       // proxy transport-failure circuit breaker
 	cacheBust bool
 	cbParam   string
+	browser   browser.Options // browser-mode execution options
 	// OnResult, if set, is called for every final result (concurrently). It must
 	// be safe for concurrent use.
 	OnResult func(Result)
@@ -172,22 +195,51 @@ func New(clients *httpclient.Pool, blocks BlockStore, opts Options) *Pool {
 		health:    newHealth(opts.ProxyFailLimit, opts.ProxyCooldown),
 		cacheBust: opts.CacheBust,
 		cbParam:   opts.CacheBustParam,
+		browser: browser.Options{
+			Headless:  opts.Headless,
+			Timeout:   opts.BrowserTimeout,
+			Insecure:  opts.Insecure,
+			UserAgent: opts.UserAgent,
+		},
 	}
 }
 
 // Run consumes jobs until the channel is closed or ctx is cancelled and returns
-// the aggregated Summary.
+// the aggregated Summary. It runs a single group of p.workers workers over one
+// job channel; RunGroups is the multi-target (dedicated-split) form.
 func (p *Pool) Run(ctx context.Context, jobs <-chan Job) *Summary {
+	return p.RunGroups(ctx, []Group{{Workers: p.workers, Jobs: jobs}})
+}
+
+// Group is a dedicated set of workers bound to one job channel. Each group's
+// workers only process that group's jobs, so weighting the worker count per
+// target partitions the pool across targets (dedicated split).
+type Group struct {
+	Workers int
+	Jobs    <-chan Job
+}
+
+// RunGroups starts every group's workers over its own job channel, all sharing
+// the same client pool and one aggregated Summary. It returns when every job
+// channel is drained/closed or ctx is cancelled.
+func (p *Pool) RunGroups(ctx context.Context, groups []Group) *Summary {
 	summary := &Summary{}
 	start := time.Now()
 
 	var wg sync.WaitGroup
-	for i := 0; i < p.workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			p.worker(ctx, jobs, summary)
-		}()
+	for _, g := range groups {
+		n := g.Workers
+		if n < 1 {
+			n = 1
+		}
+		jobs := g.Jobs
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				p.worker(ctx, jobs, summary)
+			}()
+		}
 	}
 	wg.Wait()
 
@@ -242,7 +294,11 @@ func (p *Pool) do(ctx context.Context, job Job) Result {
 		}
 		exclude[client.ProxyID] = true
 
-		last = p.fire(ctx, client, job, domain)
+		if isBrowser(job.Mode) {
+			last = p.fireBrowser(ctx, client, job, domain)
+		} else {
+			last = p.fire(ctx, client, job, domain)
+		}
 		attempts++
 
 		if !retryable(last) || attempts > p.retries {
@@ -272,19 +328,84 @@ func (p *Pool) fire(ctx context.Context, client *httpclient.Client, job Job, dom
 		target = addCacheBuster(job.URL, p.cbParam)
 	}
 
+	// Method + params: POST/PUT/PATCH send the JSON params as the body; the rest
+	// merge them into the query string.
+	method := normalizeMethod(job.Method)
+	req := client.RC.R().SetContext(ctx)
+	if job.Params != "" {
+		// Expand {{...}} generators fresh for this request so each one gets unique
+		// data (random email/string/number/uuid/…).
+		params := tmpl.Expand(job.Params)
+		if bodyMethods[method] {
+			req.SetHeader("Content-Type", "application/json").SetBody(params)
+		} else if q, qerr := jsonToQuery(params); qerr == nil {
+			for k, v := range q {
+				req.SetQueryParam(k, v)
+			}
+		}
+	}
+
 	start := time.Now()
-	resp, err := client.RC.R().SetContext(ctx).Get(target)
+	resp, err := req.Execute(method, target)
 	res.Latency = time.Since(start)
 	res.Err = err
 	if err == nil {
 		res.StatusCode = resp.StatusCode()
 		res.Blocked = looksBlocked(resp)
 	}
+	res.retry = res.Err != nil || res.Blocked
 
 	// Transport health: only a transport error marks a proxy as failing; any HTTP
 	// response (even a block) proves the proxy is alive.
 	if !client.Direct() {
 		if err != nil {
+			p.health.onFail(client.ProxyID)
+		} else {
+			p.health.onOK(client.ProxyID)
+		}
+	}
+	p.updateBlocks(ctx, client, domain, res)
+	return res
+}
+
+// isBrowser reports whether a job runs through the browser (Chromium) executor.
+func isBrowser(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "browser")
+}
+
+// fireBrowser runs a browser-mode job: it executes the flow (params) against the
+// target through the picked proxy in a headless Chromium, then classifies and
+// feeds the outcome back into health and the block store like fire does. A blocked
+// or connection-level failure is retryable through another proxy; a page/assertion
+// failure is not.
+func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job Job, domain string) Result {
+	res := Result{URL: job.URL, Domain: domain, ProxyURL: client.ProxyURL}
+
+	if p.limiter != nil {
+		if err := p.limiter.Wait(ctx); err != nil {
+			res.Err = err
+			return res
+		}
+	}
+
+	flow, err := browser.ParseFlow(job.Params)
+	if err != nil {
+		res.Err = err // a malformed flow is a config error, not worth retrying
+		return res
+	}
+
+	start := time.Now()
+	oc := browser.Execute(ctx, job.URL, flow, client.ProxyURL, p.browser)
+	res.Latency = time.Since(start)
+	res.StatusCode = oc.Status
+	res.Err = oc.Err
+	res.Blocked = blockedStatuses[oc.Status] || looksBlockedText(oc.BodyText) || looksBlockedURL(oc.FinalURL)
+	res.retry = res.Blocked || oc.Transport
+
+	// Transport health: only a connection-level failure marks the proxy as failing;
+	// a completed flow (even a blocked page or a failed assertion) proves it is alive.
+	if !client.Direct() {
+		if oc.Transport {
 			p.health.onFail(client.ProxyID)
 		} else {
 			p.health.onOK(client.ProxyID)
@@ -300,7 +421,7 @@ func (p *Pool) fire(ctx context.Context, client *httpclient.Client, job Job, dom
 // read-only. Note: a pool with a direct client (no proxies) is always usable.
 func (p *Pool) AnyUsable(ctx context.Context, domains []string) bool {
 	for _, d := range domains {
-		if p.pick(ctx, d, nil) != nil {
+		if p.pick(ctx, domainOf(d), nil) != nil {
 			return true
 		}
 	}
@@ -341,19 +462,22 @@ func (p *Pool) pick(ctx context.Context, domain string, exclude map[int64]bool) 
 // it (the proxy reached the origin). Transport errors are left to the health
 // tracker.
 func (p *Pool) updateBlocks(ctx context.Context, c *httpclient.Client, domain string, res Result) {
-	if p.blocks == nil || c.Direct() || res.Err != nil {
+	if p.blocks == nil || c.Direct() {
 		return
 	}
 	if res.Blocked {
 		_ = p.blocks.OnBlocked(ctx, c.ProxyID, domain)
 		return
 	}
+	if res.Err != nil {
+		return // transport/logic failure with no block signal: leave to the health tracker
+	}
 	_ = p.blocks.OnSuccess(ctx, c.ProxyID, domain)
 }
 
 // retryable reports whether a result is worth retrying through another proxy.
 func retryable(r Result) bool {
-	return r.Err != nil || r.Blocked
+	return r.retry
 }
 
 // looksBlocked classifies a response as a block by status code, body challenge
@@ -365,23 +489,44 @@ func looksBlocked(resp *resty.Response) bool {
 	if blockedStatuses[resp.StatusCode()] {
 		return true
 	}
-	if body := resp.Body(); len(body) > 0 {
-		b := strings.ToLower(string(body))
-		if len(b) > 8192 { // only scan the head; challenge pages announce early
-			b = b[:8192]
-		}
-		for _, m := range blockMarkers {
-			if strings.Contains(b, m) {
-				return true
-			}
-		}
+	if looksBlockedText(string(resp.Body())) {
+		return true
 	}
 	if resp.RawResponse != nil && resp.RawResponse.Request != nil {
-		finalURL := strings.ToLower(resp.RawResponse.Request.URL.String())
-		for _, m := range urlMarkers {
-			if strings.Contains(finalURL, m) {
-				return true
-			}
+		return looksBlockedURL(resp.RawResponse.Request.URL.String())
+	}
+	return false
+}
+
+// looksBlockedText reports whether a page body contains an anti-bot challenge /
+// block marker. Only the head is scanned (challenge pages announce early). Shared
+// by the HTTP and browser paths.
+func looksBlockedText(body string) bool {
+	if body == "" {
+		return false
+	}
+	b := strings.ToLower(body)
+	if len(b) > 8192 {
+		b = b[:8192]
+	}
+	for _, m := range blockMarkers {
+		if strings.Contains(b, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksBlockedURL reports whether a (final) URL landed on a common block/challenge
+// path.
+func looksBlockedURL(finalURL string) bool {
+	if finalURL == "" {
+		return false
+	}
+	u := strings.ToLower(finalURL)
+	for _, m := range urlMarkers {
+		if strings.Contains(u, m) {
+			return true
 		}
 	}
 	return false

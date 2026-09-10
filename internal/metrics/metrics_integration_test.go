@@ -10,8 +10,9 @@ import (
 	"github.com/minhho11/dd/internal/metrics"
 )
 
-// TestReportFlush runs the reporter against real Postgres and checks that an
-// interval's per-URL deltas land in the report table. Runs only with DD_TEST_DSN.
+// TestReportFlush runs the reporter against real Postgres and checks that each
+// URL ends up as a single row holding its cumulative totals, updated in place
+// across ticks (upsert). Runs only with DD_TEST_DSN.
 func TestReportFlush(t *testing.T) {
 	dsn := os.Getenv("DD_TEST_DSN")
 	if dsn == "" {
@@ -53,18 +54,21 @@ func TestReportFlush(t *testing.T) {
 		t.Fatalf("scan: %v", err)
 	}
 
-	// Sum per URL across however many interval rows were written.
-	sum := map[string][2]int64{}
+	// One row per URL (upsert), each holding cumulative totals.
+	byURL := map[string][2]int64{}
 	for _, r := range rows {
-		s := sum[r.URL]
-		s[0] += r.Success
-		s[1] += r.Fail
-		sum[r.URL] = s
+		if _, seen := byURL[r.URL]; seen {
+			t.Errorf("url %q has more than one row; want exactly one", r.URL)
+		}
+		byURL[r.URL] = [2]int64{r.Success, r.Fail}
 	}
-	if sum["a.com"] != [2]int64{3, 1} {
-		t.Errorf("a.com report sum = %v, want [3 1]", sum["a.com"])
+	if len(rows) != 2 {
+		t.Errorf("got %d report rows, want 2 (one per URL)", len(rows))
 	}
-	if sum["b.vn"] != [2]int64{0, 1} {
-		t.Errorf("b.vn report sum = %v, want [0 1]", sum["b.vn"])
+	if byURL["a.com"] != [2]int64{3, 1} {
+		t.Errorf("a.com report row = %v, want [3 1]", byURL["a.com"])
+	}
+	if byURL["b.vn"] != [2]int64{0, 1} {
+		t.Errorf("b.vn report row = %v, want [0 1]", byURL["b.vn"])
 	}
 }
