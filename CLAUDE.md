@@ -82,8 +82,24 @@ default (`-timeout`). Authenticated proxies work — credentials are answered ov
 CDP Fetch domain since Chrome's `--proxy-server` takes none. Blocks are detected the
 same way as http (status 403/429/503, body challenge markers, or a block URL); a
 block or a connection failure retries through another proxy, a page/assertion failure
-does not. Example:
+does not. **SOCKS proxies are skipped for browser jobs** (`isSOCKS` in `pool.pick`/
+`AnyUsable`) — Chromium cannot authenticate SOCKS5 proxies, so a browser flow can
+only use HTTP/HTTPS proxies (dd answers their `407` over the CDP Fetch domain) or run
+direct; http-mode jobs still use SOCKS proxies normally. **Per-step debug logging** is
+toggled by the `browser_debug` config key (seed flag `-browser-debug`): when on, each
+browser navigation/step logs ok/FAIL during the run (`pool.fireBrowser` builds a
+prefixed `browser.Options.Logf`); flip it live in the `config` table. Example:
 `{"steps":[{"action":"fill","selector":"#email","value":"{{randEmail}}"},{"action":"fill","selector":"#pass","value":"{{randString:12}}"},{"action":"click","selector":"button[type=submit]"},{"action":"waitVisible","selector":".dashboard"},{"action":"assertText","selector":".welcome","contains":"Welcome"}]}`
+
+**Manual confirm (`-browser-test URL`):** runs one target's browser flow **once** and
+exits — no pool, no reporter, no "until blocked" flooding — for verifying a flow works.
+It loads the `urls` row matching `URL`, runs the flow direct (or through
+`-browser-test-proxy URL`), logs each navigation/step ok/FAIL, and prints the final
+status + PASSED/FAILED. Pair with `-headless=false` to watch the browser and
+`-browser-test-hold 30s` to keep it open afterward. `runBrowserTest` in `main.go`
+(via `TargetRepo.LoadByURL` + `browser.Execute` with a `Logf`/`HoldOpen`). Exits 0
+whether the flow passed or failed (it errors only on setup problems). Example:
+`./bin/dd -dsn ... -browser-test https://site/register -headless=false -browser-test-hold 20s`.
 
 **Random params (`{{...}}` generators):** params/flow values may contain placeholders
 expanded **fresh on every request/run** (`internal/tmpl`, `tmpl.Expand`, called from

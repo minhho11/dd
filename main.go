@@ -25,6 +25,7 @@ import (
 
 	"github.com/uptrace/bun"
 
+	"github.com/minhho11/dd/internal/browser"
 	cfgdb "github.com/minhho11/dd/internal/config"
 	"github.com/minhho11/dd/internal/db"
 	"github.com/minhho11/dd/internal/httpclient"
@@ -63,6 +64,11 @@ type config struct {
 	cacheBustParam string
 	reportInterval time.Duration
 	headless       bool
+	browserDebug   bool // seed: log each browser step during the run (config: browser_debug)
+
+	browserTest      string        // one-shot: run this URL's browser flow once and exit
+	browserTestProxy string        // optional proxy for the one-shot test ("" = direct)
+	browserTestHold  time.Duration // keep the browser open this long after the test
 }
 
 func main() {
@@ -113,6 +119,12 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 	}
 	defer database.Close()
 
+	// One-shot manual confirm: run a single browser flow once and exit, bypassing
+	// the pool/reporter/proxy machinery entirely.
+	if cfg.browserTest != "" {
+		return runBrowserTest(ctx, database, cfg, out)
+	}
+
 	endpoints, cache, err := loadProxyState(ctx, database, cfg, out)
 	if err != nil {
 		return err
@@ -154,6 +166,56 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 	return runFromDB(ctx, database, cfg, out, endpoints, blocks, tuning, onResult)
 }
 
+// runBrowserTest loads one target by URL and runs its browser flow exactly once,
+// direct or through -browser-test-proxy, logging each step and printing pass/fail.
+// It never starts the pool, reporter, or "until blocked" producer, so it can't
+// flood — the tool for manually confirming a flow works. It exits 0 whether the
+// flow passed or failed (the flow ran); it errors only on setup problems.
+func runBrowserTest(ctx context.Context, database *bun.DB, cfg config, out io.Writer) error {
+	tgtRepo := cfgdb.NewTargetRepo(database)
+	if err := tgtRepo.EnsureSchema(ctx); err != nil {
+		return fmt.Errorf("ensure urls schema: %w", err)
+	}
+	t, err := tgtRepo.LoadByURL(ctx, cfg.browserTest)
+	if err != nil {
+		return fmt.Errorf("load target %q (check the url matches a urls row exactly): %w", cfg.browserTest, err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(t.Mode), "browser") {
+		return fmt.Errorf("target %q is mode=%q, not browser", t.URL, t.Mode)
+	}
+	flow, err := browser.ParseFlow(t.Params)
+	if err != nil {
+		return fmt.Errorf("parse flow: %w", err)
+	}
+
+	via := "direct"
+	if cfg.browserTestProxy != "" {
+		via = cfg.browserTestProxy
+	}
+	fmt.Fprintf(out, "browser-test: %s\n  via=%s headless=%t timeout=%s steps=%d\n",
+		t.URL, via, cfg.headless, cfg.timeout, len(flow.Steps))
+
+	oc := browser.Execute(ctx, t.URL, flow, cfg.browserTestProxy, browser.Options{
+		Headless:  cfg.headless,
+		Timeout:   cfg.timeout,
+		Insecure:  cfg.insecure,
+		UserAgent: cfg.userAgent,
+		HoldOpen:  cfg.browserTestHold,
+		Logf:      func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
+	})
+
+	fmt.Fprintf(out, "\n─── browser-test result ───\n")
+	fmt.Fprintf(out, "status:    %d\n", oc.Status)
+	fmt.Fprintf(out, "steps run: %d/%d\n", oc.Steps, len(flow.Steps)+1)
+	fmt.Fprintf(out, "final URL: %s\n", oc.FinalURL)
+	if oc.Err != nil {
+		fmt.Fprintf(out, "result:    FAILED — %v\n", oc.Err)
+	} else {
+		fmt.Fprintf(out, "result:    PASSED\n")
+	}
+	return nil
+}
+
 // poolTuning holds the operational proxy-health knobs that stay on the CLI (not
 // in the DB config), so the run path passes them through unchanged.
 type poolTuning struct {
@@ -176,6 +238,7 @@ func cliRunConfig(cfg config) cfgdb.Config {
 		Human:          cfg.human,
 		UserAgent:      cfg.userAgent,
 		Insecure:       cfg.insecure,
+		BrowserDebug:   cfg.browserDebug,
 	}
 }
 
@@ -323,6 +386,8 @@ func executeOneRun(ctx context.Context, out io.Writer, rc cfgdb.Config, targets 
 		BrowserTimeout: rc.Timeout(),
 		Insecure:       rc.Insecure,
 		UserAgent:      rc.UserAgent,
+		BrowserDebug:   rc.BrowserDebug,
+		BrowserLog:     func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
 	})
 	wp.OnResult = onResult
 
@@ -381,13 +446,14 @@ func produceTarget(ctx context.Context, wp *pool.Pool, t cfgdb.Target, rc cfgdb.
 
 	if t.Requests <= 0 && hasProxies {
 		domain := []string{t.URL}
+		browserMode := strings.EqualFold(strings.TrimSpace(t.Mode), "browser")
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			if !wp.AnyUsable(ctx, domain) {
+			if !wp.AnyUsable(ctx, domain, browserMode) {
 				return
 			}
 			select {
@@ -502,37 +568,45 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	cacheBustParam := fs.String("cache-bust-param", "_", "seed: query param name used for cache busting")
 	reportInterval := fs.Duration("report-interval", 30*time.Second, "how often to upsert per-URL success/fail into the `report` table (<=0 uses 30s)")
 	headless := fs.Bool("headless", true, "run browser-mode (mode='browser') targets in headless Chromium; set false to watch")
+	browserDebug := fs.Bool("browser-debug", false, "seed: log each browser navigation/step during the run (toggle live via config.browser_debug)")
+	browserTest := fs.String("browser-test", "", "run the browser flow for this urls.url once and exit (manual confirm); pairs with -headless=false")
+	browserTestProxy := fs.String("browser-test-proxy", "", "proxy URL to route the -browser-test run through (default direct)")
+	browserTestHold := fs.Duration("browser-test-hold", 0, "keep the browser open this long after a -browser-test run (e.g. 30s) to inspect it")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
 
 	return config{
-		workers:        *workers,
-		urls:           splitList(*urls),
-		requests:       *requests,
-		dsn:            *dsn,
-		seed:           splitList(*seed),
-		timeout:        *timeout,
-		insecure:       *insecure,
-		verbose:        *verbose,
-		human:          *human,
-		userAgent:      *userAgent,
-		blockAfter:     *blockAfter,
-		blockFor:       *blockFor,
-		blockTTL:       *blockTTL,
-		blockCacheMax:  *blockCacheMax,
-		blockPrune:     *blockPrune,
-		retries:        *retries,
-		rps:            *rps,
-		proxyFails:     *proxyFails,
-		proxyCool:      *proxyCool,
-		out:            *outFile,
-		errorLog:       *errorLog,
-		cacheBust:      *cacheBust,
-		cacheBustParam: *cacheBustParam,
-		reportInterval: *reportInterval,
-		headless:       *headless,
+		workers:          *workers,
+		urls:             splitList(*urls),
+		requests:         *requests,
+		dsn:              *dsn,
+		seed:             splitList(*seed),
+		timeout:          *timeout,
+		insecure:         *insecure,
+		verbose:          *verbose,
+		human:            *human,
+		userAgent:        *userAgent,
+		blockAfter:       *blockAfter,
+		blockFor:         *blockFor,
+		blockTTL:         *blockTTL,
+		blockCacheMax:    *blockCacheMax,
+		blockPrune:       *blockPrune,
+		retries:          *retries,
+		rps:              *rps,
+		proxyFails:       *proxyFails,
+		proxyCool:        *proxyCool,
+		out:              *outFile,
+		errorLog:         *errorLog,
+		cacheBust:        *cacheBust,
+		cacheBustParam:   *cacheBustParam,
+		reportInterval:   *reportInterval,
+		headless:         *headless,
+		browserDebug:     *browserDebug,
+		browserTest:      *browserTest,
+		browserTestProxy: *browserTestProxy,
+		browserTestHold:  *browserTestHold,
 	}, nil
 }
 

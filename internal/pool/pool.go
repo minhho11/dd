@@ -6,6 +6,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"net/url"
 	"strings"
@@ -100,6 +101,11 @@ type Options struct {
 	BrowserTimeout time.Duration // per-step/navigation timeout for browser flows
 	Insecure       bool          // ignore TLS cert errors in the browser
 	UserAgent      string        // override the browser User-Agent when non-empty
+
+	// BrowserDebug, when true and BrowserLog is set, logs each browser navigation/
+	// step (ok/FAIL) during the run. Toggled from the config table (browser_debug).
+	BrowserDebug bool
+	BrowserLog   func(format string, args ...any)
 }
 
 // Summary aggregates results after a run.
@@ -158,15 +164,17 @@ func (s *Summary) record(r Result) {
 
 // Pool runs jobs across a fixed number of workers using a shared client pool.
 type Pool struct {
-	workers   int
-	retries   int
-	clients   *httpclient.Pool
-	blocks    BlockStore    // optional; nil disables the domain-block feedback loop
-	limiter   *rate.Limiter // optional; nil means unlimited
-	health    *health       // proxy transport-failure circuit breaker
-	cacheBust bool
-	cbParam   string
-	browser   browser.Options // browser-mode execution options
+	workers      int
+	retries      int
+	clients      *httpclient.Pool
+	blocks       BlockStore    // optional; nil disables the domain-block feedback loop
+	limiter      *rate.Limiter // optional; nil means unlimited
+	health       *health       // proxy transport-failure circuit breaker
+	cacheBust    bool
+	cbParam      string
+	browser      browser.Options // browser-mode execution options
+	browserDebug bool
+	browserLog   func(format string, args ...any)
 	// OnResult, if set, is called for every final result (concurrently). It must
 	// be safe for concurrent use.
 	OnResult func(Result)
@@ -201,6 +209,8 @@ func New(clients *httpclient.Pool, blocks BlockStore, opts Options) *Pool {
 			Insecure:  opts.Insecure,
 			UserAgent: opts.UserAgent,
 		},
+		browserDebug: opts.BrowserDebug,
+		browserLog:   opts.BrowserLog,
 	}
 }
 
@@ -284,7 +294,7 @@ func (p *Pool) do(ctx context.Context, job Job) Result {
 		default:
 		}
 
-		client := p.pick(ctx, domain, exclude)
+		client := p.pick(ctx, domain, exclude, isBrowser(job.Mode))
 		if client == nil {
 			if attempts == 0 {
 				return Result{URL: job.URL, Domain: domain, Err: ErrAllBlocked}
@@ -373,6 +383,12 @@ func isBrowser(mode string) bool {
 	return strings.EqualFold(strings.TrimSpace(mode), "browser")
 }
 
+// isSOCKS reports whether a proxy URL uses a SOCKS scheme (socks/socks4/socks5),
+// which Chromium cannot authenticate — skipped for browser jobs.
+func isSOCKS(proxyURL string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(proxyURL)), "socks")
+}
+
 // fireBrowser runs a browser-mode job: it executes the flow (params) against the
 // target through the picked proxy in a headless Chromium, then classifies and
 // feeds the outcome back into health and the block store like fire does. A blocked
@@ -394,8 +410,18 @@ func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job J
 		return res
 	}
 
+	opts := p.browser
+	if p.browserDebug && p.browserLog != nil {
+		via := "direct"
+		if client.ProxyURL != "" {
+			via = client.ProxyURL
+		}
+		prefix := fmt.Sprintf("[browser %s via %s]", job.URL, via)
+		opts.Logf = func(f string, a ...any) { p.browserLog(prefix+" "+f, a...) }
+	}
+
 	start := time.Now()
-	oc := browser.Execute(ctx, job.URL, flow, client.ProxyURL, p.browser)
+	oc := browser.Execute(ctx, job.URL, flow, client.ProxyURL, opts)
 	res.Latency = time.Since(start)
 	res.StatusCode = oc.Status
 	res.Err = oc.Err
@@ -419,9 +445,9 @@ func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job J
 // one of the given domains (not quarantined and not health-cooled-down). The
 // "run until all proxies blocked" mode polls this to decide when to stop. It is
 // read-only. Note: a pool with a direct client (no proxies) is always usable.
-func (p *Pool) AnyUsable(ctx context.Context, domains []string) bool {
+func (p *Pool) AnyUsable(ctx context.Context, domains []string, browserMode bool) bool {
 	for _, d := range domains {
-		if p.pick(ctx, domainOf(d), nil) != nil {
+		if p.pick(ctx, domainOf(d), nil, browserMode) != nil {
 			return true
 		}
 	}
@@ -431,8 +457,10 @@ func (p *Pool) AnyUsable(ctx context.Context, domains []string) bool {
 // pick chooses a random usable client for the domain: not in exclude, not cooled
 // down by the health tracker, and not quarantined for the domain. rand.Perm gives
 // a random visit order. Returns nil when nothing is usable. A direct client
-// (ProxyID 0) bypasses the health/block checks.
-func (p *Pool) pick(ctx context.Context, domain string, exclude map[int64]bool) *httpclient.Client {
+// (ProxyID 0) bypasses the health/block checks. For browserMode jobs, SOCKS
+// proxies are skipped — Chromium cannot authenticate SOCKS5 proxies, so routing a
+// browser flow through one always fails.
+func (p *Pool) pick(ctx context.Context, domain string, exclude map[int64]bool, browserMode bool) *httpclient.Client {
 	clients := p.clients.Clients()
 
 	for _, idx := range rand.Perm(len(clients)) {
@@ -442,6 +470,9 @@ func (p *Pool) pick(ctx context.Context, domain string, exclude map[int64]bool) 
 		}
 		if c.Direct() {
 			return c
+		}
+		if browserMode && isSOCKS(c.ProxyURL) {
+			continue
 		}
 		if !p.health.usable(c.ProxyID) {
 			continue

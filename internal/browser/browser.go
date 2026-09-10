@@ -22,6 +22,13 @@ type Options struct {
 	Timeout   time.Duration // default per-step (and navigation) timeout; <=0 uses 30s
 	Insecure  bool          // ignore TLS certificate errors
 	UserAgent string        // override the browser User-Agent when non-empty
+
+	// Logf, when set, is called with a human-readable line per navigation/step for
+	// interactive debugging (the one-shot browser-test mode). nil in the load path.
+	Logf func(format string, args ...any)
+	// HoldOpen keeps the browser open this long after the flow finishes, so a visible
+	// (headless=false) run can be inspected. Ignored when <=0.
+	HoldOpen time.Duration
 }
 
 // Outcome is the result of running one flow.
@@ -110,6 +117,10 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 	}
 
 	out := Outcome{}
+	logf := opts.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 
 	// Resolve flow variables once for this run so fields that reference the same
 	// {{name}} (e.g. password + confirm) get one shared value.
@@ -120,17 +131,21 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 		if err := runAction(runCtx, stepTimeout, chromedp.Navigate(tmpl.Expand(entryURL))); err != nil {
 			out.Err = fmt.Errorf("navigate %s: %w", entryURL, err)
 			out.Transport = true // failing to load the entry page is a connection issue
+			logf("navigate %s → FAIL: %v", entryURL, err)
 			captureState(runCtx, &out)
 			out.Status = readStatus(&mu, &docStatus)
+			holdOpen(runCtx, opts.HoldOpen, logf)
 			return out
 		}
 		out.Steps++
+		logf("navigate %s → ok", entryURL)
 	}
 
 	for i, s := range flow.Steps {
 		act, err := stepAction(s, vars)
 		if err != nil {
 			out.Err = fmt.Errorf("step %d: %w", i+1, err)
+			logf("step %d %s → FAIL: %v", i+1, s.Action, err)
 			break
 		}
 		d := stepTimeout
@@ -144,14 +159,32 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 			// A failed navigation is a connection issue (retry via another proxy);
 			// a failed fill/click/wait/assert is a page/logic failure (don't retry).
 			out.Transport = isNavStep(s.Action)
+			logf("step %d %s %s → FAIL: %v", i+1, s.Action, s.Selector, err)
 			break
 		}
 		out.Steps++
+		logf("step %d %s %s → ok", i+1, s.Action, s.Selector)
 	}
 
 	captureState(runCtx, &out)
 	out.Status = readStatus(&mu, &docStatus)
+	holdOpen(runCtx, opts.HoldOpen, logf)
 	return out
+}
+
+// holdOpen keeps the browser process alive for d (so a visible run can be
+// inspected), returning early if the context is cancelled.
+func holdOpen(ctx context.Context, d time.Duration, logf func(string, ...any)) {
+	if d <= 0 {
+		return
+	}
+	logf("holding browser open for %s (Ctrl-C to stop)…", d)
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 func readStatus(mu *sync.Mutex, status *int) int {

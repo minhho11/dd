@@ -129,7 +129,7 @@ func TestPickSkipsBlockedProxy(t *testing.T) {
 
 	// Every pick must avoid proxy 1.
 	for i := 0; i < 10; i++ {
-		c := p.pick(context.Background(), domain, nil)
+		c := p.pick(context.Background(), domain, nil, false)
 		if c == nil {
 			t.Fatalf("pick returned nil while proxy 2 is available")
 		}
@@ -140,7 +140,7 @@ func TestPickSkipsBlockedProxy(t *testing.T) {
 
 	// Block the second proxy too: no proxy left -> nil.
 	fb.blocked[key(2, domain)] = true
-	if c := p.pick(context.Background(), domain, nil); c != nil {
+	if c := p.pick(context.Background(), domain, nil, false); c != nil {
 		t.Fatalf("pick = proxy %d, want nil when all blocked", c.ProxyID)
 	}
 }
@@ -156,7 +156,7 @@ func TestPickIsRandom(t *testing.T) {
 
 	seen := map[int64]int{}
 	for i := 0; i < 500; i++ {
-		c := p.pick(context.Background(), "a.com", nil)
+		c := p.pick(context.Background(), "a.com", nil, false)
 		seen[c.ProxyID]++
 	}
 	if len(seen) != 5 {
@@ -303,21 +303,21 @@ func TestAnyUsable(t *testing.T) {
 	ctx := context.Background()
 	domains := []string{"a.com", "b.com"}
 
-	if !p.AnyUsable(ctx, domains) {
+	if !p.AnyUsable(ctx, domains, false) {
 		t.Fatal("fresh pool should have usable proxies")
 	}
 
 	// Block everything for a.com; b.com still open -> still usable.
 	fb.blocked[key(1, "a.com")] = true
 	fb.blocked[key(2, "a.com")] = true
-	if !p.AnyUsable(ctx, domains) {
+	if !p.AnyUsable(ctx, domains, false) {
 		t.Fatal("b.com still has usable proxies")
 	}
 
 	// Block everything for b.com too -> nothing usable anywhere.
 	fb.blocked[key(1, "b.com")] = true
 	fb.blocked[key(2, "b.com")] = true
-	if p.AnyUsable(ctx, domains) {
+	if p.AnyUsable(ctx, domains, false) {
 		t.Fatal("all proxies blocked for all domains; AnyUsable should be false")
 	}
 }

@@ -82,6 +82,14 @@ func (r *TargetRepo) LoadEnabled(ctx context.Context) ([]Target, error) {
 	return ts, nil
 }
 
+// LoadByURL returns the single target row with the given URL, regardless of its
+// enabled flag. Used by the one-shot browser-test mode.
+func (r *TargetRepo) LoadByURL(ctx context.Context, url string) (Target, error) {
+	var t Target
+	err := r.db.NewSelect().Model(&t).Where("url = ?", url).Limit(1).Scan(ctx)
+	return t, err
+}
+
 // Seed inserts a GET target for each URL that does not already exist, using
 // defaultRequests as the per-URL count and weight 1. It bootstraps the urls table
 // from the CLI -urls list on first run; existing rows are left untouched.

@@ -42,6 +42,7 @@ type Config struct {
 	Human          bool
 	UserAgent      string
 	Insecure       bool
+	BrowserDebug   bool
 }
 
 // config keys, stable across versions.
@@ -56,6 +57,7 @@ const (
 	keyHuman          = "human"
 	keyUserAgent      = "user_agent"
 	keyInsecure       = "insecure"
+	keyBrowserDebug   = "browser_debug"
 )
 
 // Timeout returns the per-request timeout.
@@ -74,6 +76,7 @@ func (c Config) toSettings() []Setting {
 		{Key: keyHuman, Value: strconv.FormatBool(c.Human)},
 		{Key: keyUserAgent, Value: c.UserAgent},
 		{Key: keyInsecure, Value: strconv.FormatBool(c.Insecure)},
+		{Key: keyBrowserDebug, Value: strconv.FormatBool(c.BrowserDebug)},
 	}
 }
 
@@ -94,6 +97,7 @@ func configFromSettings(kv map[string]string) Config {
 		Human:          atob(kv[keyHuman]),
 		UserAgent:      kv[keyUserAgent],
 		Insecure:       atob(kv[keyInsecure]),
+		BrowserDebug:   atob(kv[keyBrowserDebug]),
 	}
 }
 

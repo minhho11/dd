@@ -33,10 +33,32 @@ type Repo struct {
 // NewRepo returns a Repo backed by the given bun handle.
 func NewRepo(db *bun.DB) *Repo { return &Repo{db: db} }
 
-// EnsureSchema creates the report table if needed.
+// EnsureSchema creates the report table if needed, and reconciles columns added
+// after the table's first creation (no migration tool) with idempotent
+// ALTER ... ADD COLUMN IF NOT EXISTS, so an older report table gains them on startup.
 func (r *Repo) EnsureSchema(ctx context.Context) error {
-	_, err := r.db.NewCreateTable().Model((*Report)(nil)).IfNotExists().Exec(ctx)
-	return err
+	if _, err := r.db.NewCreateTable().Model((*Report)(nil)).IfNotExists().Exec(ctx); err != nil {
+		return err
+	}
+	alters := []string{
+		`ALTER TABLE report ADD COLUMN IF NOT EXISTS success bigint NOT NULL DEFAULT 0`,
+		`ALTER TABLE report ADD COLUMN IF NOT EXISTS fail bigint NOT NULL DEFAULT 0`,
+		`ALTER TABLE report ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now()`,
+	}
+	for _, a := range alters {
+		if _, err := r.db.ExecContext(ctx, a); err != nil {
+			return err
+		}
+	}
+	// Upsert relies on a unique key on url (ON CONFLICT (url)). A table created by
+	// an older version may lack it; add a unique index so the upsert works. This
+	// self-heals only when url has no duplicate rows — if it does, drop the report
+	// table (it is a disposable rolling tally) and let it be recreated.
+	if _, err := r.db.ExecContext(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS report_url_key ON report (url)`); err != nil {
+		return fmt.Errorf("ensure report url unique index (drop the report table if it has duplicate url rows): %w", err)
+	}
+	return nil
 }
 
 // Upsert writes each URL's cumulative row, updating the existing row in place on
