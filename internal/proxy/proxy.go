@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/uptrace/bun"
+
+	"github.com/minhho11/dd/internal/config"
 )
 
 // Proxy is a single proxy endpoint stored in Postgres. URL is a full proxy URL
@@ -31,14 +33,31 @@ func NewRepo(db *bun.DB) *Repo {
 	return &Repo{db: db}
 }
 
-// EnsureSchema creates the proxies table if it does not already exist. It is
-// safe to call on every startup.
+// EnsureSchema creates the proxies table if it does not already exist and installs
+// a NOTIFY trigger so adding, removing, or toggling a proxy restarts a watching run
+// (the same config_changed channel as config/urls). It re-creates the shared notify
+// function defensively so it is safe regardless of call order. Safe on every startup.
 func (r *Repo) EnsureSchema(ctx context.Context) error {
-	_, err := r.db.NewCreateTable().
+	if _, err := r.db.NewCreateTable().
 		Model((*Proxy)(nil)).
 		IfNotExists().
-		Exec(ctx)
-	return err
+		Exec(ctx); err != nil {
+		return err
+	}
+	stmts := []string{
+		`CREATE OR REPLACE FUNCTION dd_config_notify() RETURNS trigger AS $$
+		 BEGIN PERFORM pg_notify('` + config.NotifyChannel + `', ''); RETURN NEW; END;
+		 $$ LANGUAGE plpgsql`,
+		`DROP TRIGGER IF EXISTS dd_proxies_notify_trg ON proxies`,
+		`CREATE TRIGGER dd_proxies_notify_trg AFTER INSERT OR UPDATE OR DELETE ON proxies
+		 FOR EACH ROW EXECUTE FUNCTION dd_config_notify()`,
+	}
+	for _, s := range stmts {
+		if _, err := r.db.ExecContext(ctx, s); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // LoadActive returns every active proxy, ordered by id for stable rotation.

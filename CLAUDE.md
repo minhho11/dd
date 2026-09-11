@@ -9,8 +9,11 @@ worker pool, optionally routing each request through a proxy. **Postgres is
 required** (via go-bun): the run parameters live in a key/value `config` table and
 the targets in a `urls` table; proxies are stored and rotated round-robin. The tool
 loads config + targets, partitions its workers across the targets by weight (a
-dedicated worker group per URL), and restarts whenever config or urls change
-(LISTEN/NOTIFY). The HTTP client is go-resty/resty.
+dedicated worker group per URL), and restarts whenever config, urls, **or proxies**
+change (LISTEN/NOTIFY — all three tables carry the trigger, and proxies are re-read
+before every run so adding/toggling one takes effect on the next restart without
+restarting the process; the block cache persists across restarts, in-memory proxy
+health resets). The HTTP client is go-resty/resty.
 
 Each target has a **mode**: `http` (the default — one resty request per job) or
 `browser`, which drives a headless Chromium (chromedp) through a scripted flow —
@@ -171,7 +174,18 @@ Packages under `internal/`:
     run. `LoadEnabled` returns enabled rows; `Seed` bootstraps rows from `-urls`.
   - Operational plumbing (dsn, block/proxy internals, output files) stays on the CLI.
 - **`proxy`** — two bun models and their repos, plus the block cache:
-  - `Proxy` (table `proxies`) + `Repo`: the proxy list.
+  - `Proxy` (table `proxies`) + `Repo`: the proxy list. `EnsureSchema` also installs a
+    NOTIFY trigger on `proxies` firing the shared `config_changed` channel (re-creating
+    the `dd_config_notify()` function defensively), so adding/removing/toggling a proxy
+    restarts a watching run. `main`'s `loadProxyState` returns a `loadEndpoints` closure
+    (over `LoadActive`) that `runFromDB` calls before every run — so a restart picks up
+    the current proxy set. The `BlockCache` is created once and persists across restarts;
+    only the in-memory health tracker (rebuilt inside `executeOneRun`'s pool) resets.
+    `config.Repo.Fingerprint` (the poll fallback) hashes `proxies` too, so a lost NOTIFY
+    is still caught.
+  - `OnSuccess` no longer writes on every request: `BlockCache.OnSuccess` skips the
+    `DELETE` when the cached domain shows the proxy has no row (quarantine or partial),
+    so the common healthy-proxy success issues no DB write — the per-request hot path.
   - `ProxyBlock` (table `proxies_blocked`, unique on `(proxy_id, domain)`) + `BlockRepo`:
     the per-(proxy, domain) quarantine. `OnBlocked` increments `fail_count`; at
     `-block-after` it sets `blocked_until = now + block-for` and resets the counter.

@@ -140,7 +140,7 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 		return runBrowserTest(ctx, database, cfg, out)
 	}
 
-	endpoints, cache, err := loadProxyState(ctx, database, cfg, out)
+	loadEndpoints, cache, err := loadProxyState(ctx, database, cfg, out)
 	if err != nil {
 		return err
 	}
@@ -201,7 +201,7 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 
 	tuning := poolTuning{failLimit: cfg.proxyFails, cooldown: cfg.proxyCool, headless: cfg.headless}
 
-	return runFromDB(ctx, database, cfg, out, endpoints, blocks, tuning, onResult)
+	return runFromDB(ctx, database, cfg, out, loadEndpoints, blocks, tuning, onResult)
 }
 
 // runBrowserTest loads one target by URL and runs its browser flow exactly once,
@@ -334,10 +334,13 @@ func buildResultHandler(cfg config, out io.Writer, errLog *log.Logger, mtx *metr
 	}, cleanup, nil
 }
 
-// runFromDB loads the config and targets from the DB, seeds them from the CLI on
-// first run, runs, and restarts whenever config or urls change (LISTEN/NOTIFY). A
-// finished run idles until the next change. Returns when ctx is cancelled.
-func runFromDB(ctx context.Context, database *bun.DB, cfg config, out io.Writer, endpoints []httpclient.ProxyEndpoint, blocks pool.BlockStore, tuning poolTuning, onResult func(pool.Result)) error {
+// runFromDB loads the config, targets, and proxies from the DB, seeds them from the
+// CLI on first run, runs, and restarts whenever config, urls, or proxies change
+// (LISTEN/NOTIFY). Proxies are re-read before every run, so adding or toggling a
+// proxy takes effect on the next restart (the block cache persists across restarts;
+// in-memory proxy health resets). A finished run idles until the next change.
+// Returns when ctx is cancelled.
+func runFromDB(ctx context.Context, database *bun.DB, cfg config, out io.Writer, loadEndpoints func(context.Context) ([]httpclient.ProxyEndpoint, error), blocks pool.BlockStore, tuning poolTuning, onResult func(pool.Result)) error {
 	cfgRepo := cfgdb.NewRepo(database)
 	if err := cfgRepo.EnsureSchema(ctx); err != nil {
 		return fmt.Errorf("ensure config schema: %w", err)
@@ -362,9 +365,9 @@ func runFromDB(ctx context.Context, database *bun.DB, cfg config, out io.Writer,
 		return fmt.Errorf("watch config: %w", err)
 	}
 	if cfg.watchPoll > 0 {
-		fmt.Fprintf(out, "watching config + urls tables for changes (LISTEN config_changed, polling every %s)\n", cfg.watchPoll)
+		fmt.Fprintf(out, "watching config + urls + proxies tables for changes (LISTEN config_changed, polling every %s)\n", cfg.watchPoll)
 	} else {
-		fmt.Fprintln(out, "watching config + urls tables for changes (LISTEN config_changed)")
+		fmt.Fprintln(out, "watching config + urls + proxies tables for changes (LISTEN config_changed)")
 	}
 
 	for {
@@ -376,8 +379,16 @@ func runFromDB(ctx context.Context, database *bun.DB, cfg config, out io.Writer,
 		if err != nil {
 			return fmt.Errorf("load urls: %w", err)
 		}
-		fmt.Fprintf(out, "── config: workers=%d retries=%d rps=%s cache-bust=%t timeout=%s | %d target(s)\n",
-			rc.Workers, rc.Retries, rpsLabel(rc.RPS), rc.CacheBust, rc.Timeout(), len(targets))
+		endpoints, err := loadEndpoints(ctx)
+		if err != nil {
+			return fmt.Errorf("load proxies: %w", err)
+		}
+		proxyLabel := fmt.Sprintf("%d prox(ies)", len(endpoints))
+		if len(endpoints) == 0 {
+			proxyLabel = "direct (no proxies)"
+		}
+		fmt.Fprintf(out, "── config: workers=%d retries=%d rps=%s cache-bust=%t timeout=%s | %d target(s) | %s\n",
+			rc.Workers, rc.Retries, rpsLabel(rc.RPS), rc.CacheBust, rc.Timeout(), len(targets), proxyLabel)
 
 		runCtx, runCancel := context.WithCancel(ctx)
 		done := make(chan *pool.Summary, 1)
@@ -391,14 +402,14 @@ func runFromDB(ctx context.Context, database *bun.DB, cfg config, out io.Writer,
 			<-done
 			return nil
 		case <-changes:
-			fmt.Fprintln(out, "config/urls changed — restarting run")
+			fmt.Fprintln(out, "config/urls/proxies changed — restarting run")
 			runCancel()
 			<-done
 			continue
 		case summary := <-done:
 			runCancel()
 			printSummary(out, summary)
-			fmt.Fprintln(out, "run complete — waiting for next config/urls change")
+			fmt.Fprintln(out, "run complete — waiting for next config/urls/proxies change")
 			select {
 			case <-ctx.Done():
 				return nil
@@ -695,10 +706,12 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	}, nil
 }
 
-// loadProxyState ensures the proxy/block schemas, seeds any -proxies, prunes
-// stale block rows, and returns the proxy endpoints plus the (lazy) block cache.
-// The database handle is owned by the caller.
-func loadProxyState(ctx context.Context, database *bun.DB, cfg config, out io.Writer) ([]httpclient.ProxyEndpoint, *proxy.BlockCache, error) {
+// loadProxyState ensures the proxy/block schemas, seeds any -proxies, prunes stale
+// block rows, and returns a loader that reads the current active proxies plus the
+// (lazy) block cache. The loader is called before every run so proxy changes take
+// effect on the next restart (the proxies table has a NOTIFY trigger). The database
+// handle is owned by the caller.
+func loadProxyState(ctx context.Context, database *bun.DB, cfg config, out io.Writer) (func(context.Context) ([]httpclient.ProxyEndpoint, error), *proxy.BlockCache, error) {
 	proxyRepo := proxy.NewRepo(database)
 	blockRepo := proxy.NewBlockRepo(database, cfg.blockAfter, cfg.blockFor)
 	if err := proxyRepo.EnsureSchema(ctx); err != nil {
@@ -720,25 +733,20 @@ func loadProxyState(ctx context.Context, database *bun.DB, cfg config, out io.Wr
 		fmt.Fprintf(out, "pruned %d stale block rows\n", n)
 	}
 
-	proxies, err := proxyRepo.LoadActive(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load proxies: %w", err)
-	}
-
 	cache := proxy.NewBlockCache(blockRepo, cfg.blockTTL, cfg.blockCacheMax)
 
-	if len(proxies) == 0 {
-		fmt.Fprintln(out, "no active proxies in db: running direct")
-	} else {
-		fmt.Fprintf(out, "loaded %d proxies from db (block-after=%d, block-for=%s)\n",
-			len(proxies), cfg.blockAfter, cfg.blockFor)
+	loadEndpoints := func(ctx context.Context) ([]httpclient.ProxyEndpoint, error) {
+		proxies, err := proxyRepo.LoadActive(ctx)
+		if err != nil {
+			return nil, err
+		}
+		endpoints := make([]httpclient.ProxyEndpoint, len(proxies))
+		for i, p := range proxies {
+			endpoints[i] = httpclient.ProxyEndpoint{ID: p.ID, URL: p.URL}
+		}
+		return endpoints, nil
 	}
-
-	endpoints := make([]httpclient.ProxyEndpoint, len(proxies))
-	for i, p := range proxies {
-		endpoints[i] = httpclient.ProxyEndpoint{ID: p.ID, URL: p.URL}
-	}
-	return endpoints, cache, nil
+	return loadEndpoints, cache, nil
 }
 
 func verbosePrinter(out io.Writer) func(pool.Result) {

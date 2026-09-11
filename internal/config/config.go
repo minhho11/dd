@@ -192,15 +192,18 @@ func (r *Repo) Save(ctx context.Context, c Config) error {
 	return err
 }
 
-// Fingerprint returns a hash of the full contents of the config and urls tables.
-// It changes whenever any row in either table changes, so Watch can poll it to
-// detect changes whose NOTIFY never arrived.
+// Fingerprint returns a hash of the full contents of the config, urls, and proxies
+// tables. It changes whenever any row in any of them changes, so Watch can poll it
+// to detect changes whose NOTIFY never arrived (proxies included, since adding a
+// proxy also restarts the run).
 func (r *Repo) Fingerprint(ctx context.Context) (string, error) {
 	var fp string
 	err := r.db.QueryRowContext(ctx, `SELECT md5(
 		coalesce((SELECT string_agg(key || '=' || value, E'\n' ORDER BY key) FROM config), '')
-		|| E'\n--\n' ||
-		coalesce((SELECT string_agg(u::text, E'\n' ORDER BY u.id) FROM urls u), ''))`).Scan(&fp)
+		|| E'\n--urls--\n' ||
+		coalesce((SELECT string_agg(u::text, E'\n' ORDER BY u.id) FROM urls u), '')
+		|| E'\n--proxies--\n' ||
+		coalesce((SELECT string_agg(p.id::text || ':' || p.url || ':' || p.active::text, E'\n' ORDER BY p.id) FROM proxies p), ''))`).Scan(&fp)
 	return fp, err
 }
 

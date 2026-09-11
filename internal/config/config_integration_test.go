@@ -107,6 +107,11 @@ func TestWatchPollFallback(t *testing.T) {
 	if err := tr.EnsureSchema(ctx); err != nil {
 		t.Fatalf("urls schema: %v", err)
 	}
+	// Fingerprint (used by the poller) also reads the proxies table.
+	if _, err := database.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS proxies (id bigserial PRIMARY KEY, url text NOT NULL, active boolean NOT NULL DEFAULT true)`); err != nil {
+		t.Fatalf("proxies table: %v", err)
+	}
 	seed := config.Config{Workers: 3, CacheBustParam: "_"}
 	if err := repo.Save(ctx, seed); err != nil {
 		t.Fatalf("save: %v", err)
