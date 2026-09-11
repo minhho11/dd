@@ -21,7 +21,7 @@ func TestBlockLifecycle(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	database, err := db.Open(ctx, dsn, false)
+	database, err := db.Open(ctx, dsn, false, 5)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

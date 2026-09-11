@@ -153,11 +153,19 @@ func (m *Metrics) flush(ctx context.Context, repo *Repo, out io.Writer) {
 // Run upserts each URL's cumulative totals into its one report row every interval
 // until ctx is cancelled, then does a final flush (with a fresh context so it
 // still writes while shutting down).
-func (m *Metrics) Run(ctx context.Context, repo *Repo, interval time.Duration, out io.Writer) {
-	if interval <= 0 {
-		return
+//
+// interval is a function so the cadence can be changed live (e.g. from the config
+// table): it is re-read after every flush, and a changed value re-arms the ticker.
+// A value <=0 is treated as the 30s default. The first value is read immediately;
+// if it is <=0 the reporter still runs at 30s (it never disables itself here —
+// disabling reporting is the caller's decision).
+func (m *Metrics) Run(ctx context.Context, repo *Repo, interval func() time.Duration, out io.Writer) {
+	const fallback = 30 * time.Second
+	cur := interval()
+	if cur <= 0 {
+		cur = fallback
 	}
-	t := time.NewTicker(interval)
+	t := time.NewTicker(cur)
 	defer t.Stop()
 	for {
 		select {
@@ -168,6 +176,15 @@ func (m *Metrics) Run(ctx context.Context, repo *Repo, interval time.Duration, o
 			return
 		case <-t.C:
 			m.flush(ctx, repo, out)
+			next := interval()
+			if next <= 0 {
+				next = fallback
+			}
+			if next != cur {
+				cur = next
+				t.Reset(cur)
+				fmt.Fprintf(out, "report interval changed to %s\n", cur)
+			}
 		}
 	}
 }

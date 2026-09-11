@@ -174,9 +174,21 @@ type BlockSource interface {
 
 // domainBlocks is the cached set of blocked proxies for one domain.
 type domainBlocks struct {
-	blocked map[int64]time.Time // proxyID -> blocked_until (active only)
+	blocked map[int64]time.Time // proxyID -> blocked_until (quarantined)
+	partial map[int64]struct{}  // proxyID with a partial fail_count row (not yet quarantined)
 	fetched time.Time
 	elem    *list.Element // position in the LRU list
+}
+
+// hasRow reports whether the proxy is known to have a proxies_blocked row for this
+// domain (a quarantine or an accumulating partial), so a success needs a DELETE to
+// clear it. When false, there is nothing to delete and the write can be skipped.
+func (d *domainBlocks) hasRow(proxyID int64) bool {
+	if _, ok := d.blocked[proxyID]; ok {
+		return true
+	}
+	_, ok := d.partial[proxyID]
+	return ok
 }
 
 // BlockCache is a bounded, lazily-loaded cache over a BlockSource, keyed by
@@ -253,6 +265,7 @@ func (c *BlockCache) Available(ctx context.Context, proxyID int64, domain string
 func (c *BlockCache) storeLocked(domain string, set map[int64]time.Time, now time.Time) {
 	if de, ok := c.doms[domain]; ok {
 		de.blocked = set
+		de.partial = nil // partials are re-learned as this run records blocks
 		de.fetched = now
 		c.order.MoveToFront(de.elem)
 		return
@@ -271,31 +284,51 @@ func (c *BlockCache) storeLocked(domain string, set map[int64]time.Time, now tim
 	}
 }
 
-// OnBlocked writes through to the source and, if the proxy just became
-// quarantined and the domain is cached, records it immediately.
+// OnBlocked writes through to the source and updates the cached set: a quarantine
+// goes into blocked, an accumulating partial into partial, so a later success knows
+// there is a row to clear.
 func (c *BlockCache) OnBlocked(ctx context.Context, proxyID int64, domain string) error {
 	until, err := c.src.OnBlocked(ctx, proxyID, domain)
 	if err != nil {
 		return err
 	}
-	if until.IsZero() {
-		return nil
-	}
 	c.mu.Lock()
 	if de, ok := c.doms[domain]; ok {
-		de.blocked[proxyID] = until
+		if until.IsZero() {
+			if de.partial == nil {
+				de.partial = make(map[int64]struct{})
+			}
+			de.partial[proxyID] = struct{}{}
+		} else {
+			de.blocked[proxyID] = until
+			delete(de.partial, proxyID)
+		}
 		c.order.MoveToFront(de.elem)
 	}
 	c.mu.Unlock()
 	return nil
 }
 
-// OnSuccess clears the pair in the source and drops it from the cached set.
+// OnSuccess clears the pair in the source and drops it from the cached set — but
+// only writes to the DB when there is actually a row to clear. A healthy proxy has
+// no proxies_blocked row, so a success on a cached domain where the proxy is
+// neither quarantined nor accumulating skips the DELETE entirely. This removes a
+// per-request write (the dominant DB load under many workers). When the domain is
+// not cached yet, it writes through to stay correct.
 func (c *BlockCache) OnSuccess(ctx context.Context, proxyID int64, domain string) error {
+	c.mu.Lock()
+	if de, ok := c.doms[domain]; ok && !de.hasRow(proxyID) {
+		c.order.MoveToFront(de.elem)
+		c.mu.Unlock()
+		return nil // nothing to clear
+	}
+	c.mu.Unlock()
+
 	err := c.src.OnSuccess(ctx, proxyID, domain)
 	c.mu.Lock()
 	if de, ok := c.doms[domain]; ok {
 		delete(de.blocked, proxyID)
+		delete(de.partial, proxyID)
 		c.order.MoveToFront(de.elem)
 	}
 	c.mu.Unlock()

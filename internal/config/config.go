@@ -32,20 +32,21 @@ type Setting struct {
 // elsewhere. Requests here is the global default used to seed new target rows and
 // as the fallback for direct (no-proxy) runs.
 type Config struct {
-	Workers        int
-	Requests       int
-	Retries        int
-	RPS            float64
-	TimeoutSeconds int
-	CacheBust      bool
-	CacheBustParam string
-	Human          bool
-	UserAgent      string
-	Insecure       bool
-	BrowserDebug   bool
-	BrowserMax     int  // max concurrent browser (Chromium) flows; <=0 = unlimited
-	BrowserReuse   bool // reuse one browser across direct flow runs instead of relaunching
-	BrowserBlock   bool // block fonts/media/third-party trackers in browser flows
+	Workers               int
+	Requests              int
+	Retries               int
+	RPS                   float64
+	TimeoutSeconds        int
+	CacheBust             bool
+	CacheBustParam        string
+	Human                 bool
+	UserAgent             string
+	Insecure              bool
+	ReportIntervalSeconds int // how often the report table is upserted; <=0 uses 30s
+	BrowserDebug          bool
+	BrowserMax            int  // max concurrent browser (Chromium) flows; <=0 = unlimited
+	BrowserReuse          bool // reuse one browser across direct flow runs instead of relaunching
+	BrowserBlock          bool // block fonts/media/third-party trackers in browser flows
 }
 
 // config keys, stable across versions.
@@ -60,6 +61,7 @@ const (
 	keyHuman          = "human"
 	keyUserAgent      = "user_agent"
 	keyInsecure       = "insecure"
+	keyReportInterval = "report_interval_seconds"
 	keyBrowserDebug   = "browser_debug"
 	keyBrowserMax     = "browser_max"
 	keyBrowserReuse   = "browser_reuse"
@@ -68,6 +70,15 @@ const (
 
 // Timeout returns the per-request timeout.
 func (c Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
+
+// ReportInterval returns how often the report table is upserted; a non-positive
+// stored value falls back to 30s.
+func (c Config) ReportInterval() time.Duration {
+	if c.ReportIntervalSeconds <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(c.ReportIntervalSeconds) * time.Second
+}
 
 // toSettings encodes a Config as the full key/value set.
 func (c Config) toSettings() []Setting {
@@ -82,6 +93,7 @@ func (c Config) toSettings() []Setting {
 		{Key: keyHuman, Value: strconv.FormatBool(c.Human)},
 		{Key: keyUserAgent, Value: c.UserAgent},
 		{Key: keyInsecure, Value: strconv.FormatBool(c.Insecure)},
+		{Key: keyReportInterval, Value: strconv.Itoa(c.ReportIntervalSeconds)},
 		{Key: keyBrowserDebug, Value: strconv.FormatBool(c.BrowserDebug)},
 		{Key: keyBrowserMax, Value: strconv.Itoa(c.BrowserMax)},
 		{Key: keyBrowserReuse, Value: strconv.FormatBool(c.BrowserReuse)},
@@ -96,20 +108,21 @@ func configFromSettings(kv map[string]string) Config {
 	atof := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
 	atob := func(s string) bool { b, _ := strconv.ParseBool(s); return b }
 	return Config{
-		Workers:        atoi(kv[keyWorkers]),
-		Requests:       atoi(kv[keyRequests]),
-		Retries:        atoi(kv[keyRetries]),
-		RPS:            atof(kv[keyRPS]),
-		TimeoutSeconds: atoi(kv[keyTimeoutSeconds]),
-		CacheBust:      atob(kv[keyCacheBust]),
-		CacheBustParam: kv[keyCacheBustParam],
-		Human:          atob(kv[keyHuman]),
-		UserAgent:      kv[keyUserAgent],
-		Insecure:       atob(kv[keyInsecure]),
-		BrowserDebug:   atob(kv[keyBrowserDebug]),
-		BrowserMax:     atoi(kv[keyBrowserMax]),
-		BrowserReuse:   atob(kv[keyBrowserReuse]),
-		BrowserBlock:   atob(kv[keyBrowserBlock]),
+		Workers:               atoi(kv[keyWorkers]),
+		Requests:              atoi(kv[keyRequests]),
+		Retries:               atoi(kv[keyRetries]),
+		RPS:                   atof(kv[keyRPS]),
+		TimeoutSeconds:        atoi(kv[keyTimeoutSeconds]),
+		CacheBust:             atob(kv[keyCacheBust]),
+		CacheBustParam:        kv[keyCacheBustParam],
+		Human:                 atob(kv[keyHuman]),
+		UserAgent:             kv[keyUserAgent],
+		Insecure:              atob(kv[keyInsecure]),
+		ReportIntervalSeconds: atoi(kv[keyReportInterval]),
+		BrowserDebug:          atob(kv[keyBrowserDebug]),
+		BrowserMax:            atoi(kv[keyBrowserMax]),
+		BrowserReuse:          atob(kv[keyBrowserReuse]),
+		BrowserBlock:          atob(kv[keyBrowserBlock]),
 	}
 }
 

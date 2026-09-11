@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/minhho11/dd/internal/browser"
 	cfgdb "github.com/minhho11/dd/internal/config"
@@ -63,6 +64,8 @@ type config struct {
 	cacheBust      bool
 	cacheBustParam string
 	reportInterval time.Duration
+	skipReport     bool          // disable the report-table reporter entirely
+	dbMaxConns     int           // cap on the Postgres connection pool (0 = unbounded)
 	watchPoll      time.Duration // fallback poll of config+urls when NOTIFY is lost (0 = off)
 	headless       bool
 	browserDebug   bool // seed: log each browser step during the run (config: browser_debug)
@@ -116,8 +119,16 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 		}()
 	}
 
+	// Quiet pgdriver's own listener chatter unless -verbose. The LISTEN connection
+	// is periodically reaped by the network/pooler ("bun: ping timeout"); pgdriver
+	// reconnects on its own and the -watch-poll fallback catches any change missed
+	// meanwhile, so the warning is just noise. Keep it under -verbose for debugging.
+	if !cfg.verbose {
+		pgdriver.Logger = noopPGLogger{}
+	}
+
 	// Open the database once (shared by proxy state, config, urls, and reporting).
-	database, err := db.Open(ctx, cfg.dsn, cfg.verbose)
+	database, err := db.Open(ctx, cfg.dsn, cfg.verbose, cfg.dbMaxConns)
 	if err != nil {
 		return fmt.Errorf("connect db: %w", err)
 	}
@@ -138,26 +149,49 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 		blocks = cache
 	}
 
-	// Reporting is always on: an in-memory per-URL tally upserted into the report
-	// table every -report-interval. Its stop+final-flush must run before the DB is
-	// closed, so register it after the database defer (defers run LIFO).
-	reportRepo := metrics.NewRepo(database)
-	if err := reportRepo.EnsureSchema(ctx); err != nil {
-		return fmt.Errorf("ensure report schema: %w", err)
+	// Reporting: an in-memory per-URL tally upserted into the report table every
+	// report interval. The interval lives in the config table (report_interval_seconds,
+	// seeded from -report-interval) so it can be changed live; the reporter re-reads
+	// it each cycle. On by default; -skip-report turns it off entirely (no schema,
+	// no reporter goroutine, no per-result recording) — for when the report table
+	// isn't wanted or its writes are unwelcome. Its stop+final-flush must run before
+	// the DB is closed, so register it after the database defer (defers run LIFO).
+	var mtx *metrics.Metrics
+	if cfg.skipReport {
+		fmt.Fprintln(out, "report table disabled (-skip-report)")
+	} else {
+		// The config table is the source of the interval, so ensure + seed it before
+		// the reporter reads it. runFromDB ensures + seeds again (idempotent).
+		cfgRepo := cfgdb.NewRepo(database)
+		if err := cfgRepo.EnsureSchema(ctx); err != nil {
+			return fmt.Errorf("ensure config schema: %w", err)
+		}
+		if err := cfgRepo.EnsureDefault(ctx, cliRunConfig(cfg)); err != nil {
+			return fmt.Errorf("seed config: %w", err)
+		}
+		reportRepo := metrics.NewRepo(database)
+		if err := reportRepo.EnsureSchema(ctx); err != nil {
+			return fmt.Errorf("ensure report schema: %w", err)
+		}
+		// intervalOf reads the current report interval from the config table; on a load
+		// error it keeps the last good value (0 first time → reporter's 30s default).
+		last := cfg.reportInterval
+		intervalOf := func() time.Duration {
+			if rc, lerr := cfgRepo.Load(ctx); lerr == nil {
+				last = rc.ReportInterval()
+			}
+			return last
+		}
+		mtx = metrics.New()
+		reporterCtx, reporterCancel := context.WithCancel(ctx)
+		reporterDone := make(chan struct{})
+		go func() {
+			defer close(reporterDone)
+			mtx.Run(reporterCtx, reportRepo, intervalOf, out)
+		}()
+		defer func() { reporterCancel(); <-reporterDone }()
+		fmt.Fprintf(out, "reporting per-URL success/fail to `report` table every %s (config.report_interval_seconds)\n", intervalOf())
 	}
-	interval := cfg.reportInterval
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
-	mtx := metrics.New()
-	reporterCtx, reporterCancel := context.WithCancel(ctx)
-	reporterDone := make(chan struct{})
-	go func() {
-		defer close(reporterDone)
-		mtx.Run(reporterCtx, reportRepo, interval, out)
-	}()
-	defer func() { reporterCancel(); <-reporterDone }()
-	fmt.Fprintf(out, "reporting per-URL success/fail to `report` table every %s\n", interval)
 
 	onResult, closeHandlers, err := buildResultHandler(cfg, out, errLog, mtx)
 	if err != nil {
@@ -222,6 +256,12 @@ func runBrowserTest(ctx context.Context, database *bun.DB, cfg config, out io.Wr
 	return nil
 }
 
+// noopPGLogger discards pgdriver's internal log output (listener reconnect
+// warnings). Installed unless -verbose; see the note in run.
+type noopPGLogger struct{}
+
+func (noopPGLogger) Printf(context.Context, string, ...any) {}
+
 // poolTuning holds the operational proxy-health knobs that stay on the CLI (not
 // in the DB config), so the run path passes them through unchanged.
 type poolTuning struct {
@@ -234,20 +274,21 @@ type poolTuning struct {
 // table on first run.
 func cliRunConfig(cfg config) cfgdb.Config {
 	return cfgdb.Config{
-		Workers:        cfg.workers,
-		Requests:       cfg.requests,
-		Retries:        cfg.retries,
-		RPS:            cfg.rps,
-		TimeoutSeconds: int(cfg.timeout / time.Second),
-		CacheBust:      cfg.cacheBust,
-		CacheBustParam: cfg.cacheBustParam,
-		Human:          cfg.human,
-		UserAgent:      cfg.userAgent,
-		Insecure:       cfg.insecure,
-		BrowserDebug:   cfg.browserDebug,
-		BrowserMax:     cfg.browserMax,
-		BrowserReuse:   cfg.browserReuse,
-		BrowserBlock:   cfg.browserBlock,
+		Workers:               cfg.workers,
+		Requests:              cfg.requests,
+		Retries:               cfg.retries,
+		RPS:                   cfg.rps,
+		TimeoutSeconds:        int(cfg.timeout / time.Second),
+		ReportIntervalSeconds: int(cfg.reportInterval / time.Second),
+		CacheBust:             cfg.cacheBust,
+		CacheBustParam:        cfg.cacheBustParam,
+		Human:                 cfg.human,
+		UserAgent:             cfg.userAgent,
+		Insecure:              cfg.insecure,
+		BrowserDebug:          cfg.browserDebug,
+		BrowserMax:            cfg.browserMax,
+		BrowserReuse:          cfg.browserReuse,
+		BrowserBlock:          cfg.browserBlock,
 	}
 }
 
@@ -599,6 +640,8 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	cacheBust := fs.Bool("cache-bust", false, "seed: append a unique query param to each request to bypass caches (nginx/CDN)")
 	cacheBustParam := fs.String("cache-bust-param", "_", "seed: query param name used for cache busting")
 	reportInterval := fs.Duration("report-interval", 30*time.Second, "how often to upsert per-URL success/fail into the `report` table (<=0 uses 30s)")
+	skipReport := fs.Bool("skip-report", false, "disable the `report` table entirely (no schema, no periodic upserts); the end-of-run summary still prints")
+	dbMaxConns := fs.Int("db-max-conns", 10, "max Postgres connections dd opens (0 = unbounded); keeps dd from exhausting a shared server's connection slots under load")
 	watchPoll := fs.Duration("watch-poll", 10*time.Second, "also poll the config + urls tables this often and restart on a change, for when LISTEN/NOTIFY is lost (pooler, dropped connection); 0 = NOTIFY only")
 	headless := fs.Bool("headless", true, "run browser-mode (mode='browser') targets in headless Chromium; set false to watch")
 	browserDebug := fs.Bool("browser-debug", false, "seed: log each browser navigation/step during the run (toggle live via config.browser_debug)")
@@ -638,6 +681,8 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		cacheBust:        *cacheBust,
 		cacheBustParam:   *cacheBustParam,
 		reportInterval:   *reportInterval,
+		skipReport:       *skipReport,
+		dbMaxConns:       *dbMaxConns,
 		watchPoll:        *watchPoll,
 		headless:         *headless,
 		browserDebug:     *browserDebug,

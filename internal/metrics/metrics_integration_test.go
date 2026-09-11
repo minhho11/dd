@@ -20,7 +20,7 @@ func TestReportFlush(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	database, err := db.Open(ctx, dsn, false)
+	database, err := db.Open(ctx, dsn, false, 5)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -44,7 +44,10 @@ func TestReportFlush(t *testing.T) {
 	// A short-interval reporter: run it, let one tick fire, then cancel (final flush).
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	go func() { defer close(done); m.Run(rctx, repo, 40*time.Millisecond, os.Stderr) }()
+	go func() {
+		defer close(done)
+		m.Run(rctx, repo, func() time.Duration { return 40 * time.Millisecond }, os.Stderr)
+	}()
 	time.Sleep(120 * time.Millisecond)
 	cancel()
 	<-done

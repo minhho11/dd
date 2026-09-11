@@ -16,8 +16,27 @@ import (
 // a ping. dsn is a standard Postgres URL, e.g.
 // postgres://user:pass@localhost:5432/dbname?sslmode=disable
 // When verbose is true, every query is logged via bundebug.
-func Open(ctx context.Context, dsn string, verbose bool) (*bun.DB, error) {
+//
+// maxOpenConns bounds the pool so dd cannot exhaust the server's connection slots
+// under load (its per-request block-store writes would otherwise open one
+// connection per concurrent query — SQLSTATE 53300, "too many clients already",
+// especially when the DB is shared). Queries queue on a full pool instead. A value
+// <1 leaves the pool unbounded (the database/sql default). The LISTEN/NOTIFY
+// watcher uses its own dedicated connection outside this pool, so bounding it never
+// starves change notifications.
+func Open(ctx context.Context, dsn string, verbose bool, maxOpenConns int) (*bun.DB, error) {
 	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dsn)))
+
+	if maxOpenConns > 0 {
+		sqldb.SetMaxOpenConns(maxOpenConns)
+		idle := maxOpenConns
+		if idle > 4 {
+			idle = 4 // keep a few warm; let the rest close when idle
+		}
+		sqldb.SetMaxIdleConns(idle)
+		sqldb.SetConnMaxIdleTime(90 * time.Second)
+		sqldb.SetConnMaxLifetime(30 * time.Minute)
+	}
 
 	db := bun.NewDB(sqldb, pgdialect.New())
 	if verbose {

@@ -19,7 +19,7 @@ func TestConfigLoadAndWatch(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	database, err := db.Open(ctx, dsn, false)
+	database, err := db.Open(ctx, dsn, false, 5)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestWatchPollFallback(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	database, err := db.Open(ctx, dsn, false)
+	database, err := db.Open(ctx, dsn, false, 5)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestTargetRepo(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	database, err := db.Open(ctx, dsn, false)
+	database, err := db.Open(ctx, dsn, false, 5)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

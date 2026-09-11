@@ -13,9 +13,16 @@ import (
 // fakeSource is an in-memory BlockSource that counts LoadDomain calls so tests
 // can assert cache hits/misses without a database.
 type fakeSource struct {
-	mu    sync.Mutex
-	rows  map[string][]proxy.ProxyBlock // domain -> active blocks
-	loads map[string]int                // domain -> LoadDomain call count
+	mu           sync.Mutex
+	rows         map[string][]proxy.ProxyBlock // domain -> active blocks
+	loads        map[string]int                // domain -> LoadDomain call count
+	successCalls int                           // OnSuccess DB writes actually issued
+}
+
+func (f *fakeSource) successCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.successCalls
 }
 
 func newFakeSource() *fakeSource {
@@ -40,6 +47,7 @@ func (f *fakeSource) OnBlocked(_ context.Context, proxyID int64, domain string) 
 func (f *fakeSource) OnSuccess(_ context.Context, proxyID int64, domain string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.successCalls++
 	kept := f.rows[domain][:0]
 	for _, r := range f.rows[domain] {
 		if r.ProxyID != proxyID {
@@ -119,6 +127,55 @@ func TestBlockCacheWriteThrough(t *testing.T) {
 	}
 	if ok, _ := c.Available(ctx, 5, "a.com"); !ok {
 		t.Error("proxy 5 should be available again after OnSuccess")
+	}
+}
+
+// TestBlockCacheOnSuccessSkipsNoop verifies that a success for a proxy with no
+// block row on a cached domain issues no DB write (the per-request hot path), while
+// a success that actually clears a block does write.
+func TestBlockCacheOnSuccessSkipsNoop(t *testing.T) {
+	src := newFakeSource()
+	c := proxy.NewBlockCache(src, time.Minute, 10)
+	ctx := context.Background()
+
+	// Warm the domain (empty). Now repeated successes for an unblocked proxy must
+	// not touch the source.
+	if ok, _ := c.Available(ctx, 7, "a.com"); !ok {
+		t.Fatal("proxy 7 should start available")
+	}
+	for i := 0; i < 100; i++ {
+		if err := c.OnSuccess(ctx, 7, "a.com"); err != nil {
+			t.Fatalf("OnSuccess: %v", err)
+		}
+	}
+	if n := src.successCount(); n != 0 {
+		t.Errorf("no-op successes issued %d DB writes, want 0", n)
+	}
+
+	// A success that clears a real block must write exactly once, then go quiet.
+	if err := c.OnBlocked(ctx, 7, "a.com"); err != nil {
+		t.Fatalf("OnBlocked: %v", err)
+	}
+	if err := c.OnSuccess(ctx, 7, "a.com"); err != nil {
+		t.Fatalf("OnSuccess: %v", err)
+	}
+	if n := src.successCount(); n != 1 {
+		t.Errorf("clearing success issued %d DB writes, want 1", n)
+	}
+	for i := 0; i < 10; i++ {
+		_ = c.OnSuccess(ctx, 7, "a.com")
+	}
+	if n := src.successCount(); n != 1 {
+		t.Errorf("after clearing, further no-op successes issued writes: got %d, want 1", n)
+	}
+
+	// A domain that was never cached falls through to a write (correctness over the
+	// optimization when we can't prove there's nothing to clear).
+	if err := c.OnSuccess(ctx, 9, "uncached.com"); err != nil {
+		t.Fatalf("OnSuccess uncached: %v", err)
+	}
+	if n := src.successCount(); n != 2 {
+		t.Errorf("uncached-domain success should write through: got %d, want 2", n)
 	}
 }
 
