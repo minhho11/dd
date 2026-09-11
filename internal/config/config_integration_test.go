@@ -59,7 +59,7 @@ func TestConfigLoadAndWatch(t *testing.T) {
 	// Watch, then Save a change: the watcher must fire via NOTIFY.
 	watchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	changes, err := repo.Watch(watchCtx)
+	changes, err := repo.Watch(watchCtx, config.WatchOptions{})
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
@@ -79,6 +79,77 @@ func TestConfigLoadAndWatch(t *testing.T) {
 
 	if got, _ := repo.Load(ctx); got.Workers != 20 {
 		t.Errorf("after Save, workers = %d, want 20", got.Workers)
+	}
+}
+
+// TestWatchPollFallback checks that a change whose NOTIFY never arrives (trigger
+// disabled here; in the wild a transaction-mode pooler or a dropped listener
+// connection) is still picked up by polling, and that a NOTIFY-delivered change
+// does not fire a second time from the poller. Runs only when DD_TEST_DSN is set.
+func TestWatchPollFallback(t *testing.T) {
+	dsn := os.Getenv("DD_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set DD_TEST_DSN to run the Postgres integration test")
+	}
+	ctx := context.Background()
+
+	database, err := db.Open(ctx, dsn, false)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer database.Close()
+
+	repo := config.NewRepo(database)
+	if err := repo.EnsureSchema(ctx); err != nil {
+		t.Fatalf("config schema: %v", err)
+	}
+	tr := config.NewTargetRepo(database)
+	if err := tr.EnsureSchema(ctx); err != nil {
+		t.Fatalf("urls schema: %v", err)
+	}
+	seed := config.Config{Workers: 3, CacheBustParam: "_"}
+	if err := repo.Save(ctx, seed); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	changes, err := repo.Watch(watchCtx, config.WatchOptions{Poll: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// A NOTIFY-delivered change fires exactly once (the poller re-baselines).
+	seed.Workers = 4
+	if err := repo.Save(ctx, seed); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	select {
+	case <-changes:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for NOTIFY-delivered change")
+	}
+	select {
+	case <-changes:
+		t.Fatal("poller fired a duplicate event for a change NOTIFY already delivered")
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	// With the trigger off no NOTIFY is sent; polling must still catch the change.
+	if _, err := database.ExecContext(ctx, `ALTER TABLE config DISABLE TRIGGER dd_config_notify_trg`); err != nil {
+		t.Fatalf("disable trigger: %v", err)
+	}
+	defer database.ExecContext(ctx, `ALTER TABLE config ENABLE TRIGGER dd_config_notify_trg`)
+
+	seed.Workers = 5
+	if err := repo.Save(ctx, seed); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	select {
+	case <-changes:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for poll-detected change")
 	}
 }
 

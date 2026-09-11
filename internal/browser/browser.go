@@ -11,6 +11,7 @@ import (
 
 	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 
 	"github.com/minhho11/dd/internal/tmpl"
@@ -22,6 +23,11 @@ type Options struct {
 	Timeout   time.Duration // default per-step (and navigation) timeout; <=0 uses 30s
 	Insecure  bool          // ignore TLS certificate errors
 	UserAgent string        // override the browser User-Agent when non-empty
+
+	// BlockResources blocks requests a form flow never needs — web fonts, media, and
+	// third-party analytics/ads/session-replay scripts (see blockedPatterns) — to
+	// save browser CPU and bandwidth.
+	BlockResources bool
 
 	// Logf, when set, is called with a human-readable line per navigation/step for
 	// interactive debugging (the one-shot browser-test mode). nil in the load path.
@@ -48,7 +54,8 @@ type Outcome struct {
 // proxy — the proxy is a browser-level setting, so proxy rotation needs a new
 // process. Any step error (including a failed assertion) stops the flow and is
 // returned in Outcome.Err; the browser is always torn down before returning. For
-// repeated direct runs, a Runner reuses one browser instead (see runner.go).
+// repeated runs, a Runner shares one browser across runs instead, giving each run
+// a fresh browser context with its own proxy (see runner.go).
 func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, opts Options) Outcome {
 	stepTimeout := normalizeTimeout(opts.Timeout)
 
@@ -60,7 +67,7 @@ func Execute(ctx context.Context, entryURL string, flow Flow, proxyURL string, o
 
 	status := newStatusHolder()
 	listen(taskCtx, status, user, pass)
-	if err := enableDomains(taskCtx, user != ""); err != nil {
+	if err := enableDomains(taskCtx, user != "", opts.BlockResources); err != nil {
 		return Outcome{Err: fmt.Errorf("start browser: %w", err), Transport: true}
 	}
 
@@ -162,10 +169,51 @@ func listen(taskCtx context.Context, status *statusHolder, user, pass string) {
 	})
 }
 
-// enableDomains turns on the CDP Network domain (for status capture) and, when the
-// proxy needs auth, the Fetch domain with auth handling.
-func enableDomains(taskCtx context.Context, needAuth bool) error {
+// blockedPatterns are URLPattern strings (https://urlpattern.spec.whatwg.org/) for
+// requests a scripted form flow never needs: web fonts, audio/video, and
+// third-party analytics, ad and session-replay scripts. CSS and first-party
+// scripts are deliberately left alone — waitVisible/assertVisible depend on CSS
+// and forms on their own JS — and so are captcha providers (reCAPTCHA, hCaptcha,
+// Turnstile), which a form may require.
+var blockedPatterns = []string{
+	// web fonts
+	"*://*:*/*.woff2", "*://*:*/*.woff", "*://*:*/*.ttf", "*://*:*/*.otf", "*://*:*/*.eot",
+	// media
+	"*://*:*/*.mp4", "*://*:*/*.webm", "*://*:*/*.mp3", "*://*:*/*.ogg", "*://*:*/*.wav", "*://*:*/*.m4a",
+	// analytics / ads / tag managers / session replay
+	"*://*google-analytics.com:*/*",
+	"*://*googletagmanager.com:*/*",
+	"*://*doubleclick.net:*/*",
+	"*://*googlesyndication.com:*/*",
+	"*://*googleadservices.com:*/*",
+	"*://*facebook.net:*/*",
+	"*://*hotjar.com:*/*",
+	"*://*clarity.ms:*/*",
+	"*://*segment.com:*/*",
+	"*://*segment.io:*/*",
+	"*://*mixpanel.com:*/*",
+	"*://*amplitude.com:*/*",
+	"*://*fullstory.com:*/*",
+	"*://*analytics.tiktok.com:*/*",
+}
+
+// blockAction installs blockedPatterns on the target (Network domain).
+func blockAction() chromedp.Action {
+	patterns := make([]*network.BlockPattern, len(blockedPatterns))
+	for i, p := range blockedPatterns {
+		patterns[i] = &network.BlockPattern{URLPattern: p, Block: true}
+	}
+	return network.SetBlockedURLs().WithURLPatterns(patterns)
+}
+
+// enableDomains turns on the CDP Network domain (for status capture), optionally
+// blocks unneeded resources, and, when the proxy needs auth, turns on the Fetch
+// domain with auth handling.
+func enableDomains(taskCtx context.Context, needAuth, block bool) error {
 	enable := []chromedp.Action{network.Enable()}
+	if block {
+		enable = append(enable, blockAction())
+	}
 	if needAuth {
 		enable = append(enable, fetch.Enable().WithHandleAuthRequests(true))
 	}
@@ -185,7 +233,7 @@ func runFlow(runCtx context.Context, entryURL string, flow Flow, stepTimeout tim
 
 	// Navigate the entry URL first, then run each step in order.
 	if entryURL != "" {
-		if err := runAction(runCtx, stepTimeout, chromedp.Navigate(tmpl.Expand(entryURL))); err != nil {
+		if err := runAction(runCtx, stepTimeout, navigate(tmpl.Expand(entryURL))); err != nil {
 			out.Err = fmt.Errorf("navigate %s: %w", entryURL, err)
 			out.Transport = true // failing to load the entry page is a connection issue
 			logf("navigate %s → FAIL: %v", entryURL, err)
@@ -225,6 +273,42 @@ func runFlow(runCtx context.Context, entryURL string, flow Flow, stepTimeout tim
 	return out
 }
 
+// navigate loads u in the tab and returns once the new document's DOMContentLoaded
+// fires, instead of waiting (like chromedp.Navigate) for the full load event, which
+// also waits on every image, font, iframe and slow third-party script. The steps
+// that follow wait for their own selectors, so they don't need a fully loaded
+// page. A connection-level failure (bad proxy, DNS, refused) is returned as an error.
+func navigate(u string) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		dcl := make(chan struct{}, 1)
+		lctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		chromedp.ListenTarget(lctx, func(ev any) {
+			if _, ok := ev.(*page.EventDomContentEventFired); ok {
+				select {
+				case dcl <- struct{}{}:
+				default:
+				}
+			}
+		})
+		_, loaderID, errorText, _, err := page.Navigate(u).Do(ctx)
+		switch {
+		case err != nil:
+			return err
+		case errorText != "":
+			return fmt.Errorf("page load error %s", errorText)
+		case loaderID == "":
+			return nil // same-document navigation (fragment only): no new document
+		}
+		select {
+		case <-dcl:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+}
+
 // holdOpen keeps the browser process alive for d (so a visible run can be
 // inspected), returning early if the context is cancelled.
 func holdOpen(ctx context.Context, d time.Duration, logf func(string, ...any)) {
@@ -262,7 +346,7 @@ func stepAction(s Step, vars map[string]string) (chromedp.Action, error) {
 		if u == "" {
 			return nil, fmt.Errorf("navigate: no url")
 		}
-		return chromedp.Navigate(u), nil
+		return navigate(u), nil
 	case "fill", "type", "sendkeys":
 		return chromedp.SendKeys(sel, val, chromedp.ByQuery), nil
 	case "setvalue", "select":

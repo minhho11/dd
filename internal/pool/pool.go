@@ -108,8 +108,9 @@ type Options struct {
 	BrowserLog   func(format string, args ...any)
 
 	// BrowserMax caps how many browser (Chromium) flows run concurrently across all
-	// workers; <=0 = unlimited. Each browser flow launches a Chromium, which is
-	// CPU-heavy, so this bounds CPU independently of the worker count.
+	// workers; <=0 = unlimited. Each flow renders a page in its own Chromium
+	// renderer, which is CPU-heavy, so this bounds CPU independently of the worker
+	// count.
 	BrowserMax int
 
 	// BrowserReuse reuses one browser across many direct flow runs (cookies cleared
@@ -117,6 +118,11 @@ type Options struct {
 	// on CPU. Proxied browser jobs always use a fresh browser (proxy is a
 	// browser-level setting).
 	BrowserReuse bool
+
+	// BrowserBlock blocks fonts, media and third-party analytics/ad scripts in
+	// browser flows (browser.Options.BlockResources). Toggled from the config table
+	// (browser_block).
+	BrowserBlock bool
 }
 
 // Summary aggregates results after a run.
@@ -223,6 +229,8 @@ func New(clients *httpclient.Pool, blocks BlockStore, opts Options) *Pool {
 			Timeout:   opts.BrowserTimeout,
 			Insecure:  opts.Insecure,
 			UserAgent: opts.UserAgent,
+
+			BlockResources: opts.BrowserBlock,
 		},
 		browserDebug: opts.BrowserDebug,
 		browserLog:   opts.BrowserLog,
@@ -459,7 +467,7 @@ func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job J
 		return res
 	}
 
-	// Cap concurrent Chromium instances (each is CPU-heavy) independently of the
+	// Cap concurrent browser flows (each is CPU-heavy) independently of the
 	// worker count. Workers over the cap block here until a slot frees up.
 	if p.browserSem != nil {
 		select {

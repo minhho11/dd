@@ -45,6 +45,7 @@ type Config struct {
 	BrowserDebug   bool
 	BrowserMax     int  // max concurrent browser (Chromium) flows; <=0 = unlimited
 	BrowserReuse   bool // reuse one browser across direct flow runs instead of relaunching
+	BrowserBlock   bool // block fonts/media/third-party trackers in browser flows
 }
 
 // config keys, stable across versions.
@@ -62,6 +63,7 @@ const (
 	keyBrowserDebug   = "browser_debug"
 	keyBrowserMax     = "browser_max"
 	keyBrowserReuse   = "browser_reuse"
+	keyBrowserBlock   = "browser_block"
 )
 
 // Timeout returns the per-request timeout.
@@ -83,6 +85,7 @@ func (c Config) toSettings() []Setting {
 		{Key: keyBrowserDebug, Value: strconv.FormatBool(c.BrowserDebug)},
 		{Key: keyBrowserMax, Value: strconv.Itoa(c.BrowserMax)},
 		{Key: keyBrowserReuse, Value: strconv.FormatBool(c.BrowserReuse)},
+		{Key: keyBrowserBlock, Value: strconv.FormatBool(c.BrowserBlock)},
 	}
 }
 
@@ -106,6 +109,7 @@ func configFromSettings(kv map[string]string) Config {
 		BrowserDebug:   atob(kv[keyBrowserDebug]),
 		BrowserMax:     atoi(kv[keyBrowserMax]),
 		BrowserReuse:   atob(kv[keyBrowserReuse]),
+		BrowserBlock:   atob(kv[keyBrowserBlock]),
 	}
 }
 
@@ -175,32 +179,138 @@ func (r *Repo) Save(ctx context.Context, c Config) error {
 	return err
 }
 
+// Fingerprint returns a hash of the full contents of the config and urls tables.
+// It changes whenever any row in either table changes, so Watch can poll it to
+// detect changes whose NOTIFY never arrived.
+func (r *Repo) Fingerprint(ctx context.Context) (string, error) {
+	var fp string
+	err := r.db.QueryRowContext(ctx, `SELECT md5(
+		coalesce((SELECT string_agg(key || '=' || value, E'\n' ORDER BY key) FROM config), '')
+		|| E'\n--\n' ||
+		coalesce((SELECT string_agg(u::text, E'\n' ORDER BY u.id) FROM urls u), ''))`).Scan(&fp)
+	return fp, err
+}
+
+// WatchOptions tunes Watch.
+type WatchOptions struct {
+	// Poll re-reads the tables' Fingerprint every Poll and signals when it changed:
+	// the fallback for NOTIFYs that never arrive. A transaction-mode pooler
+	// (PgBouncer, Supabase :6543, Neon -pooler) silently swallows LISTEN, and a
+	// dropped listener connection misses every change until it reconnects. <=0
+	// disables polling (NOTIFY only).
+	Poll time.Duration
+	// Logf, if set, receives watcher diagnostics (NOTIFY not delivered, a change
+	// caught only by polling).
+	Logf func(format string, args ...any)
+}
+
+// probePayload marks the self-test NOTIFY Watch sends at startup to check that
+// notifications actually reach the listener. Trigger NOTIFYs carry an empty payload.
+const probePayload = "dd:probe"
+
+// probeTimeout is how long Watch waits for its startup probe before warning that
+// LISTEN/NOTIFY is not being delivered.
+const probeTimeout = 5 * time.Second
+
 // Watch returns a channel that receives an event whenever the config or urls
 // tables change (coalesced: bursts collapse to one pending event). The channel
 // closes when ctx is cancelled. It uses Postgres LISTEN/NOTIFY on a dedicated
-// connection.
-func (r *Repo) Watch(ctx context.Context) (<-chan struct{}, error) {
+// connection, backed by polling the tables' Fingerprint (opts.Poll) so a change
+// is still picked up when the NOTIFY is lost.
+func (r *Repo) Watch(ctx context.Context, opts WatchOptions) (<-chan struct{}, error) {
+	logf := opts.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+
 	ln := pgdriver.NewListener(r.db)
 	if err := ln.Listen(ctx, NotifyChannel); err != nil {
 		return nil, err
+	}
+	notes := ln.Channel()
+
+	// Baseline before returning, so a change committed after the caller's first
+	// Load is always seen as a difference by the poller.
+	var last string
+	haveBaseline := false
+	if opts.Poll > 0 {
+		if fp, err := r.Fingerprint(ctx); err == nil {
+			last, haveBaseline = fp, true
+		}
+	}
+
+	// Self-test: if this never comes back, NOTIFY isn't reaching us.
+	if _, err := r.db.ExecContext(ctx, "SELECT pg_notify(?, ?)", NotifyChannel, probePayload); err != nil {
+		logf("watch: could not send NOTIFY probe: %v", err)
 	}
 
 	out := make(chan struct{}, 1)
 	go func() {
 		defer close(out)
 		defer func() { _ = ln.Close() }()
-		notes := ln.Channel()
+
+		signal := func() {
+			select {
+			case out <- struct{}{}:
+			default: // already pending; coalesce
+			}
+		}
+
+		var tick <-chan time.Time
+		if opts.Poll > 0 {
+			t := time.NewTicker(opts.Poll)
+			defer t.Stop()
+			tick = t.C
+		}
+		probe := time.NewTimer(probeTimeout)
+		defer probe.Stop()
+		probeC := probe.C
+		pollFailing := false
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case _, ok := <-notes:
+			case n, ok := <-notes:
 				if !ok {
 					return
 				}
-				select {
-				case out <- struct{}{}: // signal
-				default: // already pending; coalesce
+				if n.Payload == probePayload {
+					probeC = nil // delivered: LISTEN/NOTIFY works
+					continue
+				}
+				// Re-baseline so the poller doesn't fire again for this same change.
+				if opts.Poll > 0 {
+					if fp, err := r.Fingerprint(ctx); err == nil {
+						last, haveBaseline = fp, true
+					}
+				}
+				signal()
+			case <-probeC:
+				probeC = nil
+				if opts.Poll > 0 {
+					logf("watch: warning: LISTEN/NOTIFY not delivered within %s (DSN through a transaction-mode pooler such as PgBouncer / Supabase :6543 / Neon -pooler?) — changes will be picked up by polling every %s", probeTimeout, opts.Poll)
+				} else {
+					logf("watch: warning: LISTEN/NOTIFY not delivered within %s (DSN through a transaction-mode pooler such as PgBouncer / Supabase :6543 / Neon -pooler?) and polling is off — config/urls changes will NOT restart the run", probeTimeout)
+				}
+			case <-tick:
+				fp, err := r.Fingerprint(ctx)
+				if err != nil {
+					if !pollFailing && ctx.Err() == nil {
+						logf("watch: poll failed: %v", err)
+					}
+					pollFailing = true
+					continue
+				}
+				pollFailing = false
+				if !haveBaseline {
+					last, haveBaseline = fp, true
+					continue
+				}
+				if fp != last {
+					last = fp
+					logf("watch: config/urls change detected by polling (its NOTIFY was not received)")
+					signal()
 				}
 			}
 		}

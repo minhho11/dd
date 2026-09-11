@@ -53,8 +53,9 @@ is blocked — per-URL value lives in the `urls` table), `-retries` (2), `-rps`
 per-domain cache trust), `-block-cache-max` (1024 domains, LRU), `-block-prune` (24h
 startup cleanup), `-proxy-fail-limit` (3), `-proxy-cooldown` (1m), `-out
 results.csv|.jsonl`, `-error-log err.log` (errors only, appended), `-report-interval`
-(30s; `<=0` uses 30s), `-verbose`, `-headless` (true; run browser-mode targets
-headless, set false to watch the browser).
+(30s; `<=0` uses 30s), `-watch-poll` (10s; also poll the config + urls tables and
+restart on a change, the fallback for lost NOTIFYs; 0 = NOTIFY only), `-verbose`,
+`-headless` (true; run browser-mode targets headless, set false to watch the browser).
 
 **`urls` table (per target):** `url`, `mode` (`http` default / `browser`), `method`
 (GET/POST/PUT/PATCH/DELETE/HEAD; ignored in browser mode), `params` (JSON — for http:
@@ -152,9 +153,16 @@ Packages under `internal/`:
     retries, rps, timeout, cache-bust, human, user-agent, insecure), encoded as k/v rows.
     `Repo` has `EnsureSchema` (table + the shared `dd_config_notify` trigger),
     `EnsureDefault` (seed the k/v rows only if the table is empty), `Load` (assemble a
-    `Config`), `Save` (upsert k/v), and `Watch(ctx)` which turns Postgres
-    `LISTEN config_changed` into a Go channel. `Config.Requests` is the global default
-    used to seed new target rows and as the direct-mode fallback.
+    `Config`), `Save` (upsert k/v), and `Watch(ctx, WatchOptions)` which turns Postgres
+    `LISTEN config_changed` into a Go channel. NOTIFY can be lost silently (a
+    transaction-mode pooler — PgBouncer, Supabase `:6543`, Neon `-pooler` — swallows
+    LISTEN; a dropped listener connection misses events until it reconnects), so
+    `Watch` also polls `Fingerprint` (md5 over both tables' rows) every
+    `WatchOptions.Poll` (`-watch-poll`) and signals on a difference; a NOTIFY-delivered
+    change re-baselines the poller so it doesn't fire twice. At startup it sends a
+    self-test NOTIFY (payload `dd:probe`, ignored as a change) and logs a warning if
+    it isn't received within 5s. `Config.Requests` is the global default used to seed
+    new target rows and as the direct-mode fallback.
   - `Target` (table `urls`) + `TargetRepo`: one row per URL with `mode` (`http`/
     `browser`), `method`, `params` (JSON), `weight`, `requests`, `enabled`.
     `EnsureSchema` creates the table, adds later columns idempotently (`ALTER TABLE
@@ -236,7 +244,8 @@ per-proxy, in-memory, triggered by *transport failures* (dead/unreachable proxy)
 ensures the `config` + `urls` schemas, seeds both from the CLI defaults on first run
 (`cliRunConfig` → `EnsureDefault`, `-urls` → `TargetRepo.Seed`), and supervises: it
 loads the current config + enabled targets, runs them via `executeOneRun`, and on a
-`LISTEN config_changed` event (fired by either table's trigger on any change) cancels
+`LISTEN config_changed` event (fired by either table's trigger on any change, or by
+the `-watch-poll` fallback when the NOTIFY was lost) cancels
 the current run and restarts with the freshly-loaded state. A finished run idles until
 the next change.
 

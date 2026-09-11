@@ -63,10 +63,12 @@ type config struct {
 	cacheBust      bool
 	cacheBustParam string
 	reportInterval time.Duration
+	watchPoll      time.Duration // fallback poll of config+urls when NOTIFY is lost (0 = off)
 	headless       bool
 	browserDebug   bool // seed: log each browser step during the run (config: browser_debug)
 	browserMax     int  // seed: max concurrent browser flows (config: browser_max)
 	browserReuse   bool // seed: reuse one browser across direct runs (config: browser_reuse)
+	browserBlock   bool // seed: block fonts/media/trackers in flows (config: browser_block)
 
 	browserTest      string        // one-shot: run this URL's browser flow once and exit
 	browserTestProxy string        // optional proxy for the one-shot test ("" = direct)
@@ -203,7 +205,9 @@ func runBrowserTest(ctx context.Context, database *bun.DB, cfg config, out io.Wr
 		Insecure:  cfg.insecure,
 		UserAgent: cfg.userAgent,
 		HoldOpen:  cfg.browserTestHold,
-		Logf:      func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
+
+		BlockResources: cfg.browserBlock,
+		Logf:           func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
 	})
 
 	fmt.Fprintf(out, "\n─── browser-test result ───\n")
@@ -243,6 +247,7 @@ func cliRunConfig(cfg config) cfgdb.Config {
 		BrowserDebug:   cfg.browserDebug,
 		BrowserMax:     cfg.browserMax,
 		BrowserReuse:   cfg.browserReuse,
+		BrowserBlock:   cfg.browserBlock,
 	}
 }
 
@@ -308,11 +313,18 @@ func runFromDB(ctx context.Context, database *bun.DB, cfg config, out io.Writer,
 		return fmt.Errorf("seed urls: %w", err)
 	}
 
-	changes, err := cfgRepo.Watch(ctx)
+	changes, err := cfgRepo.Watch(ctx, cfgdb.WatchOptions{
+		Poll: cfg.watchPoll,
+		Logf: func(f string, a ...any) { fmt.Fprintf(out, f+"\n", a...) },
+	})
 	if err != nil {
 		return fmt.Errorf("watch config: %w", err)
 	}
-	fmt.Fprintln(out, "watching config + urls tables for changes (LISTEN config_changed)")
+	if cfg.watchPoll > 0 {
+		fmt.Fprintf(out, "watching config + urls tables for changes (LISTEN config_changed, polling every %s)\n", cfg.watchPoll)
+	} else {
+		fmt.Fprintln(out, "watching config + urls tables for changes (LISTEN config_changed)")
+	}
 
 	for {
 		rc, err := cfgRepo.Load(ctx)
@@ -394,6 +406,7 @@ func executeOneRun(ctx context.Context, out io.Writer, rc cfgdb.Config, targets 
 		BrowserLog:     func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
 		BrowserMax:     rc.BrowserMax,
 		BrowserReuse:   rc.BrowserReuse,
+		BrowserBlock:   rc.BrowserBlock,
 	})
 	wp.OnResult = onResult
 
@@ -586,10 +599,12 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	cacheBust := fs.Bool("cache-bust", false, "seed: append a unique query param to each request to bypass caches (nginx/CDN)")
 	cacheBustParam := fs.String("cache-bust-param", "_", "seed: query param name used for cache busting")
 	reportInterval := fs.Duration("report-interval", 30*time.Second, "how often to upsert per-URL success/fail into the `report` table (<=0 uses 30s)")
+	watchPoll := fs.Duration("watch-poll", 10*time.Second, "also poll the config + urls tables this often and restart on a change, for when LISTEN/NOTIFY is lost (pooler, dropped connection); 0 = NOTIFY only")
 	headless := fs.Bool("headless", true, "run browser-mode (mode='browser') targets in headless Chromium; set false to watch")
 	browserDebug := fs.Bool("browser-debug", false, "seed: log each browser navigation/step during the run (toggle live via config.browser_debug)")
 	browserMax := fs.Int("browser-max", 2, "seed: max concurrent browser (Chromium) flows across all workers, 0=unlimited (tune live via config.browser_max)")
 	browserReuse := fs.Bool("browser-reuse", true, "seed: reuse one browser across direct flow runs instead of relaunching per request (toggle live via config.browser_reuse)")
+	browserBlock := fs.Bool("browser-block", true, "seed: block web fonts, media and third-party analytics/ad scripts in browser flows (toggle live via config.browser_block)")
 	browserTest := fs.String("browser-test", "", "run the browser flow for this urls.url once and exit (manual confirm); pairs with -headless=false")
 	browserTestProxy := fs.String("browser-test-proxy", "", "proxy URL to route the -browser-test run through (default direct)")
 	browserTestHold := fs.Duration("browser-test-hold", 0, "keep the browser open this long after a -browser-test run (e.g. 30s) to inspect it")
@@ -623,10 +638,12 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		cacheBust:        *cacheBust,
 		cacheBustParam:   *cacheBustParam,
 		reportInterval:   *reportInterval,
+		watchPoll:        *watchPoll,
 		headless:         *headless,
 		browserDebug:     *browserDebug,
 		browserMax:       *browserMax,
 		browserReuse:     *browserReuse,
+		browserBlock:     *browserBlock,
 		browserTest:      *browserTest,
 		browserTestProxy: *browserTestProxy,
 		browserTestHold:  *browserTestHold,

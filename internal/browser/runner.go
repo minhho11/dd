@@ -28,7 +28,7 @@ func newSession(ctx context.Context, opts Options) (*session, error) {
 	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
 	status := newStatusHolder()
 	listen(taskCtx, status, "", "")
-	if err := enableDomains(taskCtx, false); err != nil {
+	if err := enableDomains(taskCtx, false, opts.BlockResources); err != nil {
 		taskCancel()
 		allocCancel()
 		return nil, err
