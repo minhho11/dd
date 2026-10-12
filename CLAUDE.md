@@ -73,7 +73,13 @@ applies the 60s default. It respects the limit, it does not defeat it.
 (seed the DB then run), `-block-after` (5), `-block-for` (30m), `-block-ttl` (5s
 per-domain cache trust), `-block-cache-max` (1024 domains, LRU), `-block-prune` (24h
 startup cleanup), `-proxy-fail-limit` (3), `-proxy-cooldown` (1m), `-out
-results.csv|.jsonl`, `-error-log err.log` (errors only, appended), `-report-interval`
+results.csv|.jsonl`, `-error-log err.log` (errors only, appended), `-skip-log-interval`
+(30s; coalesce repeated "no usable proxy" skip logs per domain — one line when a
+domain starts skipping, at most one summary with a suppressed count per interval
+while it stays blocked, and one recovery line when a proxy is usable again; 0 = log
+every skip. Keeps the error log from flooding when all proxies are blocked while still
+showing blocked/recovered state. `skipCoalescer` wraps `errorLogHandler` in
+`main.go`), `-report-interval`
 (30s; `<=0` uses 30s), `-watch-poll` (10s; also poll the config + urls tables and
 restart on a change, the fallback for lost NOTIFYs; 0 = NOTIFY only), `-verbose`,
 `-headless` (true; run browser-mode targets headless, set false to watch the browser).
