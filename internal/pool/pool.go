@@ -88,13 +88,21 @@ type Result struct {
 
 // Options configures a Pool.
 type Options struct {
-	Workers        int
-	Retries        int           // extra attempts through other proxies on block/error
-	RPS            float64       // global request rate cap; <=0 means unlimited
-	ProxyFailLimit int           // consecutive transport failures before a proxy cools down
-	ProxyCooldown  time.Duration // how long an unhealthy proxy is skipped
-	CacheBust      bool          // append a unique query param to each request
-	CacheBustParam string        // the param name (default "_")
+	Workers int
+	Retries int     // extra attempts through other proxies on block/error
+	RPS     float64 // global request rate cap; <=0 means unlimited
+
+	// ProxyRateLimit caps how many requests a single proxy (keyed by proxy ID; 0 ==
+	// the direct client) may start within any trailing ProxyRateWindow. <=0 disables
+	// it. Unlike RPS (one global cap), this is a separate sliding-window budget per
+	// proxy, so each proxy stays within a third-party per-identity limit (e.g. an API
+	// token capped at N/minute) by self-throttling. ProxyRateWindow defaults to 1m.
+	ProxyRateLimit  int
+	ProxyRateWindow time.Duration
+	ProxyFailLimit  int           // consecutive transport failures before a proxy cools down
+	ProxyCooldown   time.Duration // how long an unhealthy proxy is skipped
+	CacheBust       bool          // append a unique query param to each request
+	CacheBustParam  string        // the param name (default "_")
 
 	// Browser-mode options (mode='browser' jobs), forwarded to internal/browser.
 	Headless       bool          // run Chromium headless
@@ -184,9 +192,10 @@ type Pool struct {
 	workers      int
 	retries      int
 	clients      *httpclient.Pool
-	blocks       BlockStore    // optional; nil disables the domain-block feedback loop
-	limiter      *rate.Limiter // optional; nil means unlimited
-	health       *health       // proxy transport-failure circuit breaker
+	blocks       BlockStore        // optional; nil disables the domain-block feedback loop
+	limiter      *rate.Limiter     // optional global rate cap; nil means unlimited
+	proxyRate    *proxyRateLimiter // optional per-proxy sliding-window cap; nil means unlimited
+	health       *health           // proxy transport-failure circuit breaker
 	cacheBust    bool
 	cbParam      string
 	browser      browser.Options // browser-mode execution options
@@ -215,12 +224,17 @@ func New(clients *httpclient.Pool, blocks BlockStore, opts Options) *Pool {
 		}
 		limiter = rate.NewLimiter(rate.Limit(opts.RPS), burst)
 	}
+	window := opts.ProxyRateWindow
+	if window <= 0 {
+		window = time.Minute
+	}
 	return &Pool{
 		workers:   opts.Workers,
 		retries:   opts.Retries,
 		clients:   clients,
 		blocks:    blocks,
 		limiter:   limiter,
+		proxyRate: newProxyRateLimiter(opts.ProxyRateLimit, window),
 		health:    newHealth(opts.ProxyFailLimit, opts.ProxyCooldown),
 		cacheBust: opts.CacheBust,
 		cbParam:   opts.CacheBustParam,
@@ -368,6 +382,14 @@ func (p *Pool) fire(ctx context.Context, client *httpclient.Client, job Job, dom
 			return res
 		}
 	}
+	// Per-proxy sliding-window cap: block until this proxy is back under its budget
+	// so each proxy stays within the target's per-identity rate limit.
+	if p.proxyRate != nil {
+		if err := p.proxyRate.wait(ctx, client.ProxyID); err != nil {
+			res.Err = err
+			return res
+		}
+	}
 
 	// Cache busting: a unique query param per request so a caching layer forwards
 	// each one to origin instead of serving one cached copy. Result.URL keeps the
@@ -456,6 +478,12 @@ func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job J
 
 	if p.limiter != nil {
 		if err := p.limiter.Wait(ctx); err != nil {
+			res.Err = err
+			return res
+		}
+	}
+	if p.proxyRate != nil {
+		if err := p.proxyRate.wait(ctx, client.ProxyID); err != nil {
 			res.Err = err
 			return res
 		}

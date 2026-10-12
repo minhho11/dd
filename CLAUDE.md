@@ -48,8 +48,18 @@ watches for changes and always reports.
 split across targets by weight), `-urls` (comma-separated; seeds one GET row per URL
 into the `urls` table), `-requests` (100; default per-URL count, 0 = until every proxy
 is blocked — per-URL value lives in the `urls` table), `-retries` (2), `-rps`
-(0 = unlimited), `-timeout`, `-human` (true), `-user-agent`, `-insecure`, `-cache-bust`
-(+`-cache-bust-param`, default `_`).
+(0 = unlimited), `-proxy-rate-limit` (0 = unlimited; max requests each proxy may make
+per `-proxy-rate-window`, `-proxy-rate-window` default `1m`), `-timeout`, `-human`
+(true), `-user-agent`, `-insecure`, `-cache-bust` (+`-cache-bust-param`, default `_`).
+
+`-rps` is a single global request/second cap shared by all proxies; `-proxy-rate-limit`
+is a separate **per-proxy sliding-window** budget (config keys `proxy_rate_limit` +
+`proxy_rate_window_seconds`): at most N requests may start within any trailing window
+for a given proxy (keyed by proxy ID, 0 = direct), and a worker *sleeps* until the
+proxy's oldest in-window request ages out before firing again. Use it to keep each
+proxy within a target's per-identity rate limit (e.g. a Shopify/Recharge API token
+capped at N/min) by self-throttling — it respects the limit, it does not defeat it.
+A retry picks a different proxy, which has its own budget.
 
 **Operational flags** (stay on the CLI): `-dsn` (or `DATABASE_DSN` env), `-proxies`
 (seed the DB then run), `-block-after` (5), `-block-for` (30m), `-block-ttl` (5s
@@ -215,7 +225,10 @@ Packages under `internal/`:
   1. `pick()` — chooses a **random** usable client (`rand.Perm`), skipping proxies that are
      health-cooled-down or quarantined for the domain, and any already tried this job;
   2. execute — `fire()` for http, or `fireBrowser()` for `mode=browser`, gated by the
-     same optional `-rps` rate limit (`x/time/rate`). `fire()` sends the request via
+     same optional `-rps` global rate limit (`x/time/rate`) and then the optional
+     per-proxy sliding-window cap (`proxyRateLimiter` in `ratelimit.go`, from
+     `-proxy-rate-limit`): the worker blocks until the picked proxy is back under its
+     budget, so each proxy self-throttles to a target's per-identity limit. `fire()` sends the request via
      `req.Execute(method, url)`: for GET/HEAD/DELETE the JSON `Params` merge into the
      query (`jsonToQuery`), for POST/PUT/PATCH they become the JSON body (`params.go`).
      `fireBrowser()` parses the flow and calls `internal/browser.Execute` through the
