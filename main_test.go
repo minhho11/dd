@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func TestAllocateWorkers(t *testing.T) {
 func TestErrorLogHandlerCoalescesSkips(t *testing.T) {
 	var buf bytes.Buffer
 	l := log.New(&buf, "", 0)
-	h := errorLogHandler(l, time.Minute) // long interval: no mid-window summary
+	h := errorLogHandler(l, func() time.Duration { return time.Minute }) // long interval: no mid-window summary
 
 	skip := pool.Result{URL: "https://a.ae/x", Domain: "a.ae", Err: pool.ErrAllBlocked}
 	// Many skips for the same domain → exactly one "no usable proxy" line.
@@ -104,7 +105,7 @@ func TestErrorLogHandlerCoalescesSkips(t *testing.T) {
 func TestErrorLogHandlerSkipIntervalZeroLogsEach(t *testing.T) {
 	var buf bytes.Buffer
 	l := log.New(&buf, "", 0)
-	h := errorLogHandler(l, 0) // disabled: every skip logs
+	h := errorLogHandler(l, func() time.Duration { return 0 }) // disabled: every skip logs
 
 	skip := pool.Result{URL: "https://a.ae/x", Domain: "a.ae", Err: pool.ErrAllBlocked}
 	for i := 0; i < 5; i++ {
@@ -115,10 +116,33 @@ func TestErrorLogHandlerSkipIntervalZeroLogsEach(t *testing.T) {
 	}
 }
 
+func TestErrorLogHandlerReadsIntervalLive(t *testing.T) {
+	var buf bytes.Buffer
+	l := log.New(&buf, "", 0)
+	var interval atomic.Int64
+	interval.Store(int64(time.Minute)) // start coalescing on
+	h := errorLogHandler(l, func() time.Duration { return time.Duration(interval.Load()) })
+
+	skip := pool.Result{URL: "https://a.ae/x", Domain: "a.ae", Err: pool.ErrAllBlocked}
+	h(skip)
+	h(skip)
+	if n := strings.Count(buf.String(), "no usable proxy"); n != 1 {
+		t.Fatalf("coalescing on: want 1 line, got %d\n%s", n, buf.String())
+	}
+
+	// Flip the config to 0 (coalescing off) live: subsequent skips each log.
+	interval.Store(0)
+	h(skip)
+	h(skip)
+	if n := strings.Count(buf.String(), "no usable proxy"); n != 3 {
+		t.Fatalf("after live switch to every-skip: want 3 total, got %d\n%s", n, buf.String())
+	}
+}
+
 func TestErrorLogHandlerStillLogsRequestErrors(t *testing.T) {
 	var buf bytes.Buffer
 	l := log.New(&buf, "", 0)
-	h := errorLogHandler(l, time.Minute)
+	h := errorLogHandler(l, func() time.Duration { return time.Minute })
 
 	h(pool.Result{URL: "https://a.ae/x", Domain: "a.ae", ProxyURL: "http://p:1", Attempts: 3, Err: errors.New("dial timeout")})
 	if !strings.Contains(buf.String(), "request error") || !strings.Contains(buf.String(), "dial timeout") {

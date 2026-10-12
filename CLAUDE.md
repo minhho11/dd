@@ -69,17 +69,25 @@ watcher restarts the run with the new values (NOTIFY, or the `-watch-poll` fallb
 `Job.RateLimit`/`RateWindow` carry the per-row values into the pool; `Target.RateWindow()`
 applies the 60s default. It respects the limit, it does not defeat it.
 
+**Skip-log coalescing (`config` key, no CLI flag).** When every proxy is blocked/cooled
+down for a domain, each job returns `ErrAllBlocked` and the error log would write one
+"no usable proxy" line per request — a flood. The `config` key `skip_log_interval_seconds`
+(seeded to 30 on first run, no CLI flag) coalesces these per domain: one line when a
+domain starts skipping, at most one summary with a suppressed count per interval while it
+stays blocked, and one recovery line when a proxy is usable again — so the blocked/
+recovered state stays visible without the spam. `0` logs every skip (coalescing off).
+`skipCoalescer` wraps `errorLogHandler` in `main.go` and reads the interval **live** via a
+`skipIntervalOf` closure over `config.Repo.Load` (keeping the last good value on a load
+error), so editing the key takes effect without restarting — the same pattern the reporter
+uses for `report_interval_seconds`. `onUsable` runs on every result, so it has a lock-free
+fast path (an atomic "active skips" counter) to stay off the hot path when nothing is
+blocked.
+
 **Operational flags** (stay on the CLI): `-dsn` (or `DATABASE_DSN` env), `-proxies`
 (seed the DB then run), `-block-after` (5), `-block-for` (30m), `-block-ttl` (5s
 per-domain cache trust), `-block-cache-max` (1024 domains, LRU), `-block-prune` (24h
 startup cleanup), `-proxy-fail-limit` (3), `-proxy-cooldown` (1m), `-out
-results.csv|.jsonl`, `-error-log err.log` (errors only, appended), `-skip-log-interval`
-(30s; coalesce repeated "no usable proxy" skip logs per domain — one line when a
-domain starts skipping, at most one summary with a suppressed count per interval
-while it stays blocked, and one recovery line when a proxy is usable again; 0 = log
-every skip. Keeps the error log from flooding when all proxies are blocked while still
-showing blocked/recovered state. `skipCoalescer` wraps `errorLogHandler` in
-`main.go`), `-report-interval`
+results.csv|.jsonl`, `-error-log err.log` (errors only, appended), `-report-interval`
 (30s; `<=0` uses 30s), `-watch-poll` (10s; also poll the config + urls tables and
 restart on a change, the fallback for lost NOTIFYs; 0 = NOTIFY only), `-verbose`,
 `-headless` (true; run browser-mode targets headless, set false to watch the browser).
@@ -179,7 +187,8 @@ Packages under `internal/`:
 
 - **`config`** — the DB source of truth for a run, in two parts:
   - `Setting` (key/value `config` table) + `Repo`: the *run params* (workers, requests,
-    retries, rps, timeout, cache-bust, human, user-agent, insecure), encoded as k/v rows.
+    retries, rps, timeout, cache-bust, human, user-agent, insecure, report +
+    skip-log intervals), encoded as k/v rows.
     `Repo` has `EnsureSchema` (table + the shared `dd_config_notify` trigger),
     `EnsureDefault` (seed the k/v rows only if the table is empty), `Load` (assemble a
     `Config`), `Save` (upsert k/v), and `Watch(ctx, WatchOptions)` which turns Postgres
