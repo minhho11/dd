@@ -51,19 +51,20 @@ is blocked — per-URL value lives in the `urls` table), `-retries` (2), `-rps`
 (0 = unlimited), `-timeout`, `-human` (true), `-user-agent`, `-insecure`, `-cache-bust`
 (+`-cache-bust-param`, default `_`).
 
-**Per-proxy rate limit (config-table only, no CLI flag).** `-rps` is a single global
-request/second cap shared by all proxies; the **per-proxy sliding-window** budget is a
-separate mechanism configured *only* through the `config` table — keys
-`proxy_rate_limit` (0 = unlimited) and `proxy_rate_window_seconds` (defaults to 60 when
-unset) — with no corresponding flag. The keys are seeded disabled (`proxy_rate_limit=0`,
-`proxy_rate_window_seconds=60`) on first run via `EnsureDefault`; edit the rows to turn
-it on and the watcher restarts the run with the new values (NOTIFY, or the `-watch-poll`
-fallback). Semantics: at most N requests may start within any trailing window for a
-given proxy (keyed by proxy ID, 0 = direct), and a worker *sleeps* until that proxy's
-oldest in-window request ages out before firing again. Use it to keep each proxy within
-a target's per-identity rate limit (e.g. a Shopify/Recharge API token capped at N/min)
-by self-throttling — it respects the limit, it does not defeat it. A retry picks a
-different proxy, which has its own budget.
+**Per-URL rate limit (`urls` columns, no CLI flag).** `-rps` is a single global
+request/second cap shared by every target and proxy. Separately, each `urls` row carries
+its **own** sliding-window cap via two per-row columns (no CLI flag, no `config` key) —
+`rate_limit` (0 = unlimited) and `rate_window_seconds` (defaults to 60 when unset/0).
+Semantics: for a given URL, at most `rate_limit` requests may start within any trailing
+`rate_window_seconds`, counted **across all proxies** (the budget is keyed by the URL,
+not the proxy), and a worker *sleeps* until that URL's oldest in-window request ages out
+before firing again. This is because Shopify/Recharge-style limits are per store/token,
+not per IP: so each store (each `urls` row) gets its own request count and sleep,
+independent of the other targets. The columns are added idempotently on startup
+(`ALTER TABLE urls ADD COLUMN IF NOT EXISTS`, default 0); set them per row and the
+watcher restarts the run with the new values (NOTIFY, or the `-watch-poll` fallback).
+`Job.RateLimit`/`RateWindow` carry the per-row values into the pool; `Target.RateWindow()`
+applies the 60s default. It respects the limit, it does not defeat it.
 
 **Operational flags** (stay on the CLI): `-dsn` (or `DATABASE_DSN` env), `-proxies`
 (seed the DB then run), `-block-after` (5), `-block-for` (30m), `-block-ttl` (5s
@@ -80,7 +81,9 @@ query string for GET/HEAD/DELETE, request body for POST/PUT/PATCH; for browser: 
 `{"steps":[...]}` flow, see below), `weight` (relative share of the worker pool,
 normalized), `requests` (http: 0 = until blocked; browser: always finite — `1` runs
 the flow once as a single test, `N` repeats it under load, and `0`/unset falls back
-to the global default count since browser has no "until blocked" mode), `enabled`. New columns are added on startup
+to the global default count since browser has no "until blocked" mode), `enabled`,
+`rate_limit` (per-URL sliding-window cap, 0 = unlimited) and `rate_window_seconds`
+(the window for it, 0 → 60s) — see "Per-URL rate limit" above. New columns are added on startup
 via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (still no migration tool).
 
 **Browser mode (`mode='browser'`):** `params` is a JSON flow run in a headless
@@ -181,7 +184,8 @@ Packages under `internal/`:
     it isn't received within 5s. `Config.Requests` is the global default used to seed
     new target rows and as the direct-mode fallback.
   - `Target` (table `urls`) + `TargetRepo`: one row per URL with `mode` (`http`/
-    `browser`), `method`, `params` (JSON), `weight`, `requests`, `enabled`.
+    `browser`), `method`, `params` (JSON), `weight`, `requests`, `enabled`,
+    `rate_limit`, `rate_window_seconds` (per-URL sliding-window rate cap).
     `EnsureSchema` creates the table, adds later columns idempotently (`ALTER TABLE
     ... ADD COLUMN IF NOT EXISTS`, e.g. `mode`), and installs a NOTIFY trigger on
     `urls` firing the same `config_changed` channel, so editing a target restarts the
@@ -229,10 +233,11 @@ Packages under `internal/`:
   1. `pick()` — chooses a **random** usable client (`rand.Perm`), skipping proxies that are
      health-cooled-down or quarantined for the domain, and any already tried this job;
   2. execute — `fire()` for http, or `fireBrowser()` for `mode=browser`, gated by the
-     same optional `-rps` global rate limit (`x/time/rate`) and then the optional
-     per-proxy sliding-window cap (`proxyRateLimiter` in `ratelimit.go`, from
-     `-proxy-rate-limit`): the worker blocks until the picked proxy is back under its
-     budget, so each proxy self-throttles to a target's per-identity limit. `fire()` sends the request via
+     same optional `-rps` global rate limit (`x/time/rate`) and then the per-URL
+     sliding-window cap (`windowLimiter` in `ratelimit.go`, keyed by `job.URL`, with
+     the limit/window from `Job.RateLimit`/`RateWindow`): the worker blocks until this
+     URL is back under its budget, so each store self-throttles to its own per-token
+     limit regardless of which proxy serves it. `fire()` sends the request via
      `req.Execute(method, url)`: for GET/HEAD/DELETE the JSON `Params` merge into the
      query (`jsonToQuery`), for POST/PUT/PATCH they become the JSON body (`params.go`).
      `fireBrowser()` parses the flow and calls `internal/browser.Execute` through the

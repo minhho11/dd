@@ -7,34 +7,39 @@ import (
 	"time"
 )
 
-func TestProxyRateLimiterDisabled(t *testing.T) {
-	if newProxyRateLimiter(0, time.Minute) != nil {
-		t.Fatal("limit 0 should disable (nil) the limiter")
-	}
-	if newProxyRateLimiter(5, 0) != nil {
-		t.Fatal("window 0 should disable (nil) the limiter")
+func TestWindowLimiterUnlimited(t *testing.T) {
+	l := newWindowLimiter()
+	ctx := context.Background()
+	// limit<=0 or window<=0 means no cap: every call returns immediately.
+	for i := 0; i < 100; i++ {
+		if err := l.wait(ctx, "u", 0, time.Minute); err != nil {
+			t.Fatalf("limit 0 should be unlimited: %v", err)
+		}
+		if err := l.wait(ctx, "u", 5, 0); err != nil {
+			t.Fatalf("window 0 should be unlimited: %v", err)
+		}
 	}
 }
 
 // Within the window, the first `limit` requests are admitted immediately and the
 // next one blocks until the oldest ages out.
-func TestProxyRateLimiterBlocksWhenFull(t *testing.T) {
-	l := newProxyRateLimiter(3, 100*time.Millisecond)
+func TestWindowLimiterBlocksWhenFull(t *testing.T) {
+	l := newWindowLimiter()
 	ctx := context.Background()
+	const key = "https://shop-a.test/"
 
 	start := time.Now()
 	for i := 0; i < 3; i++ {
-		if err := l.wait(ctx, 7); err != nil {
+		if err := l.wait(ctx, key, 3, 100*time.Millisecond); err != nil {
 			t.Fatalf("admit %d: %v", i, err)
 		}
 	}
 	if elapsed := time.Since(start); elapsed > 20*time.Millisecond {
-		t.Fatalf("first %d requests should be immediate, took %s", 3, elapsed)
+		t.Fatalf("first 3 requests should be immediate, took %s", elapsed)
 	}
 
-	// 4th must wait ~the window (until the first timestamp falls out).
 	before := time.Now()
-	if err := l.wait(ctx, 7); err != nil {
+	if err := l.wait(ctx, key, 3, 100*time.Millisecond); err != nil {
 		t.Fatalf("admit 4th: %v", err)
 	}
 	if waited := time.Since(before); waited < 70*time.Millisecond {
@@ -42,34 +47,60 @@ func TestProxyRateLimiterBlocksWhenFull(t *testing.T) {
 	}
 }
 
-// Each proxy has its own independent budget.
-func TestProxyRateLimiterPerProxy(t *testing.T) {
-	l := newProxyRateLimiter(1, time.Second)
+// Each key (URL/store) has its own independent budget.
+func TestWindowLimiterPerKey(t *testing.T) {
+	l := newWindowLimiter()
 	ctx := context.Background()
 
-	if err := l.wait(ctx, 1); err != nil {
+	if err := l.wait(ctx, "https://shop-a.test/", 1, time.Second); err != nil {
 		t.Fatal(err)
 	}
-	// A different proxy still has its full allowance — must not block.
+	// A different URL still has its full allowance — must not block.
 	done := make(chan struct{})
-	go func() { _ = l.wait(ctx, 2); close(done) }()
+	go func() { _ = l.wait(ctx, "https://shop-b.test/", 1, time.Second); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(100 * time.Millisecond):
-		t.Fatal("proxy 2 blocked on proxy 1's budget")
+		t.Fatal("shop-b blocked on shop-a's budget")
+	}
+}
+
+// Different keys may carry different caps.
+func TestWindowLimiterPerKeyDifferentLimits(t *testing.T) {
+	l := newWindowLimiter()
+	ctx := context.Background()
+
+	// "a" allows 2/window, "b" allows 1/window.
+	if err := l.wait(ctx, "a", 2, 100*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.wait(ctx, "a", 2, 100*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.wait(ctx, "b", 1, 100*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	// "a"'s 3rd and "b"'s 2nd both block; just confirm "a" is independent by timing
+	// its 3rd against its own window.
+	before := time.Now()
+	if err := l.wait(ctx, "a", 2, 100*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(before); waited < 70*time.Millisecond {
+		t.Fatalf("a's 3rd should have blocked ~window, waited %s", waited)
 	}
 }
 
 // A cancelled context unblocks a waiter instead of sleeping the whole window.
-func TestProxyRateLimiterContextCancel(t *testing.T) {
-	l := newProxyRateLimiter(1, time.Hour)
-	if err := l.wait(context.Background(), 1); err != nil {
+func TestWindowLimiterContextCancel(t *testing.T) {
+	l := newWindowLimiter()
+	if err := l.wait(context.Background(), "k", 1, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
-	go func() { errc <- l.wait(ctx, 1) }()
+	go func() { errc <- l.wait(ctx, "k", 1, time.Hour) }()
 	cancel()
 	select {
 	case err := <-errc:
@@ -81,10 +112,11 @@ func TestProxyRateLimiterContextCancel(t *testing.T) {
 	}
 }
 
-// Concurrent workers sharing a proxy never exceed the limit within the window.
-func TestProxyRateLimiterConcurrent(t *testing.T) {
+// Concurrent workers sharing a key never exceed the limit within the window.
+func TestWindowLimiterConcurrent(t *testing.T) {
 	const limit = 5
-	l := newProxyRateLimiter(limit, 200*time.Millisecond)
+	const window = 200 * time.Millisecond
+	l := newWindowLimiter()
 	ctx := context.Background()
 
 	var mu sync.Mutex
@@ -94,7 +126,7 @@ func TestProxyRateLimiterConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := l.wait(ctx, 9); err != nil {
+			if err := l.wait(ctx, "k", limit, window); err != nil {
 				t.Errorf("wait: %v", err)
 				return
 			}
@@ -105,13 +137,12 @@ func TestProxyRateLimiterConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	// No window of `window` width may contain more than `limit` admissions.
 	mu.Lock()
 	defer mu.Unlock()
 	for i := range admits {
 		count := 0
 		for j := range admits {
-			if d := admits[i].Sub(admits[j]); d >= 0 && d < 200*time.Millisecond {
+			if d := admits[i].Sub(admits[j]); d >= 0 && d < window {
 				count++
 			}
 		}

@@ -36,8 +36,6 @@ type Config struct {
 	Requests              int
 	Retries               int
 	RPS                   float64
-	ProxyRateLimit        int // max requests per ProxyRateWindow per proxy; <=0 disables
-	ProxyRateWindowSecs   int // sliding window for ProxyRateLimit; <=0 means 60s
 	TimeoutSeconds        int
 	CacheBust             bool
 	CacheBustParam        string
@@ -53,37 +51,25 @@ type Config struct {
 
 // config keys, stable across versions.
 const (
-	keyWorkers         = "workers"
-	keyRequests        = "requests"
-	keyRetries         = "retries"
-	keyRPS             = "rps"
-	keyProxyRateLimit  = "proxy_rate_limit"
-	keyProxyRateWindow = "proxy_rate_window_seconds"
-	keyTimeoutSeconds  = "timeout_seconds"
-	keyCacheBust       = "cache_bust"
-	keyCacheBustParam  = "cache_bust_param"
-	keyHuman           = "human"
-	keyUserAgent       = "user_agent"
-	keyInsecure        = "insecure"
-	keyReportInterval  = "report_interval_seconds"
-	keyBrowserDebug    = "browser_debug"
-	keyBrowserMax      = "browser_max"
-	keyBrowserReuse    = "browser_reuse"
-	keyBrowserBlock    = "browser_block"
+	keyWorkers        = "workers"
+	keyRequests       = "requests"
+	keyRetries        = "retries"
+	keyRPS            = "rps"
+	keyTimeoutSeconds = "timeout_seconds"
+	keyCacheBust      = "cache_bust"
+	keyCacheBustParam = "cache_bust_param"
+	keyHuman          = "human"
+	keyUserAgent      = "user_agent"
+	keyInsecure       = "insecure"
+	keyReportInterval = "report_interval_seconds"
+	keyBrowserDebug   = "browser_debug"
+	keyBrowserMax     = "browser_max"
+	keyBrowserReuse   = "browser_reuse"
+	keyBrowserBlock   = "browser_block"
 )
 
 // Timeout returns the per-request timeout.
 func (c Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
-
-// ProxyRateWindow returns the per-proxy sliding-window duration, defaulting to 1m
-// when unset/non-positive (the limit itself is still disabled when ProxyRateLimit
-// is <=0).
-func (c Config) ProxyRateWindow() time.Duration {
-	if c.ProxyRateWindowSecs <= 0 {
-		return time.Minute
-	}
-	return time.Duration(c.ProxyRateWindowSecs) * time.Second
-}
 
 // ReportInterval returns how often the report table is upserted; a non-positive
 // stored value falls back to 30s.
@@ -101,8 +87,6 @@ func (c Config) toSettings() []Setting {
 		{Key: keyRequests, Value: strconv.Itoa(c.Requests)},
 		{Key: keyRetries, Value: strconv.Itoa(c.Retries)},
 		{Key: keyRPS, Value: strconv.FormatFloat(c.RPS, 'g', -1, 64)},
-		{Key: keyProxyRateLimit, Value: strconv.Itoa(c.ProxyRateLimit)},
-		{Key: keyProxyRateWindow, Value: strconv.Itoa(c.ProxyRateWindowSecs)},
 		{Key: keyTimeoutSeconds, Value: strconv.Itoa(c.TimeoutSeconds)},
 		{Key: keyCacheBust, Value: strconv.FormatBool(c.CacheBust)},
 		{Key: keyCacheBustParam, Value: c.CacheBustParam},
@@ -128,8 +112,6 @@ func configFromSettings(kv map[string]string) Config {
 		Requests:              atoi(kv[keyRequests]),
 		Retries:               atoi(kv[keyRetries]),
 		RPS:                   atof(kv[keyRPS]),
-		ProxyRateLimit:        atoi(kv[keyProxyRateLimit]),
-		ProxyRateWindowSecs:   atoi(kv[keyProxyRateWindow]),
 		TimeoutSeconds:        atoi(kv[keyTimeoutSeconds]),
 		CacheBust:             atob(kv[keyCacheBust]),
 		CacheBustParam:        kv[keyCacheBustParam],

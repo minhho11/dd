@@ -274,15 +274,10 @@ type poolTuning struct {
 // table on first run.
 func cliRunConfig(cfg config) cfgdb.Config {
 	return cfgdb.Config{
-		Workers:  cfg.workers,
-		Requests: cfg.requests,
-		Retries:  cfg.retries,
-		RPS:      cfg.rps,
-		// Per-proxy rate limit has no CLI flag: it is configured only via the config
-		// table (keys proxy_rate_limit / proxy_rate_window_seconds) and picked up live
-		// by the watcher. Seed it disabled, with a self-documenting 60s window.
-		ProxyRateLimit:        0,
-		ProxyRateWindowSecs:   60,
+		Workers:               cfg.workers,
+		Requests:              cfg.requests,
+		Retries:               cfg.retries,
+		RPS:                   cfg.rps,
 		TimeoutSeconds:        int(cfg.timeout / time.Second),
 		ReportIntervalSeconds: int(cfg.reportInterval / time.Second),
 		CacheBust:             cfg.cacheBust,
@@ -448,24 +443,22 @@ func executeOneRun(ctx context.Context, out io.Writer, rc cfgdb.Config, targets 
 		workers = 1
 	}
 	wp := pool.New(clients, blocks, pool.Options{
-		Workers:         workers,
-		Retries:         rc.Retries,
-		RPS:             rc.RPS,
-		ProxyRateLimit:  rc.ProxyRateLimit,
-		ProxyRateWindow: rc.ProxyRateWindow(),
-		ProxyFailLimit:  tuning.failLimit,
-		ProxyCooldown:   tuning.cooldown,
-		CacheBust:       rc.CacheBust,
-		CacheBustParam:  rc.CacheBustParam,
-		Headless:        tuning.headless,
-		BrowserTimeout:  rc.Timeout(),
-		Insecure:        rc.Insecure,
-		UserAgent:       rc.UserAgent,
-		BrowserDebug:    rc.BrowserDebug,
-		BrowserLog:      func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
-		BrowserMax:      rc.BrowserMax,
-		BrowserReuse:    rc.BrowserReuse,
-		BrowserBlock:    rc.BrowserBlock,
+		Workers:        workers,
+		Retries:        rc.Retries,
+		RPS:            rc.RPS,
+		ProxyFailLimit: tuning.failLimit,
+		ProxyCooldown:  tuning.cooldown,
+		CacheBust:      rc.CacheBust,
+		CacheBustParam: rc.CacheBustParam,
+		Headless:       tuning.headless,
+		BrowserTimeout: rc.Timeout(),
+		Insecure:       rc.Insecure,
+		UserAgent:      rc.UserAgent,
+		BrowserDebug:   rc.BrowserDebug,
+		BrowserLog:     func(f string, a ...any) { fmt.Fprintf(out, "  "+f+"\n", a...) },
+		BrowserMax:     rc.BrowserMax,
+		BrowserReuse:   rc.BrowserReuse,
+		BrowserBlock:   rc.BrowserBlock,
 	})
 	wp.OnResult = onResult
 
@@ -528,7 +521,10 @@ func isBrowserMode(mode string) bool {
 func produceTarget(ctx context.Context, wp *pool.Pool, t cfgdb.Target, rc cfgdb.Config, hasProxies bool, jobs chan<- pool.Job) {
 	defer close(jobs)
 	mk := func() pool.Job {
-		return pool.Job{URL: t.URL, Mode: t.Mode, Method: t.Method, Params: t.Params}
+		return pool.Job{
+			URL: t.URL, Mode: t.Mode, Method: t.Method, Params: t.Params,
+			RateLimit: t.RateLimit, RateWindow: t.RateWindow(),
+		}
 	}
 
 	// "Until blocked" (requests=0 with proxies) applies to http targets only.
