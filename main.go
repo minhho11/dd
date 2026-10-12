@@ -40,40 +40,38 @@ import (
 // requests, retries, …) and the target URLs are only used to *seed* the DB on
 // first run; after that the `config` and `urls` tables are the source of truth.
 type config struct {
-	workers         int
-	urls            []string
-	requests        int
-	dsn             string
-	seed            []string
-	timeout         time.Duration
-	insecure        bool
-	verbose         bool
-	human           bool
-	userAgent       string
-	blockAfter      int
-	blockFor        time.Duration
-	blockTTL        time.Duration
-	blockCacheMax   int
-	blockPrune      time.Duration
-	retries         int
-	rps             float64
-	proxyRateLimit  int           // seed: max requests per proxyRateWindow per proxy (config: proxy_rate_limit); 0 = off
-	proxyRateWindow time.Duration // seed: sliding window for proxyRateLimit (config: proxy_rate_window_seconds)
-	proxyFails      int
-	proxyCool       time.Duration
-	out             string
-	errorLog        string
-	cacheBust       bool
-	cacheBustParam  string
-	reportInterval  time.Duration
-	skipReport      bool          // disable the report-table reporter entirely
-	dbMaxConns      int           // cap on the Postgres connection pool (0 = unbounded)
-	watchPoll       time.Duration // fallback poll of config+urls when NOTIFY is lost (0 = off)
-	headless        bool
-	browserDebug    bool // seed: log each browser step during the run (config: browser_debug)
-	browserMax      int  // seed: max concurrent browser flows (config: browser_max)
-	browserReuse    bool // seed: reuse one browser across direct runs (config: browser_reuse)
-	browserBlock    bool // seed: block fonts/media/trackers in flows (config: browser_block)
+	workers        int
+	urls           []string
+	requests       int
+	dsn            string
+	seed           []string
+	timeout        time.Duration
+	insecure       bool
+	verbose        bool
+	human          bool
+	userAgent      string
+	blockAfter     int
+	blockFor       time.Duration
+	blockTTL       time.Duration
+	blockCacheMax  int
+	blockPrune     time.Duration
+	retries        int
+	rps            float64
+	proxyFails     int
+	proxyCool      time.Duration
+	out            string
+	errorLog       string
+	cacheBust      bool
+	cacheBustParam string
+	reportInterval time.Duration
+	skipReport     bool          // disable the report-table reporter entirely
+	dbMaxConns     int           // cap on the Postgres connection pool (0 = unbounded)
+	watchPoll      time.Duration // fallback poll of config+urls when NOTIFY is lost (0 = off)
+	headless       bool
+	browserDebug   bool // seed: log each browser step during the run (config: browser_debug)
+	browserMax     int  // seed: max concurrent browser flows (config: browser_max)
+	browserReuse   bool // seed: reuse one browser across direct runs (config: browser_reuse)
+	browserBlock   bool // seed: block fonts/media/trackers in flows (config: browser_block)
 
 	browserTest      string        // one-shot: run this URL's browser flow once and exit
 	browserTestProxy string        // optional proxy for the one-shot test ("" = direct)
@@ -276,12 +274,15 @@ type poolTuning struct {
 // table on first run.
 func cliRunConfig(cfg config) cfgdb.Config {
 	return cfgdb.Config{
-		Workers:               cfg.workers,
-		Requests:              cfg.requests,
-		Retries:               cfg.retries,
-		RPS:                   cfg.rps,
-		ProxyRateLimit:        cfg.proxyRateLimit,
-		ProxyRateWindowSecs:   int(cfg.proxyRateWindow / time.Second),
+		Workers:  cfg.workers,
+		Requests: cfg.requests,
+		Retries:  cfg.retries,
+		RPS:      cfg.rps,
+		// Per-proxy rate limit has no CLI flag: it is configured only via the config
+		// table (keys proxy_rate_limit / proxy_rate_window_seconds) and picked up live
+		// by the watcher. Seed it disabled, with a self-documenting 60s window.
+		ProxyRateLimit:        0,
+		ProxyRateWindowSecs:   60,
 		TimeoutSeconds:        int(cfg.timeout / time.Second),
 		ReportIntervalSeconds: int(cfg.reportInterval / time.Second),
 		CacheBust:             cfg.cacheBust,
@@ -650,8 +651,6 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 	blockPrune := fs.Duration("block-prune", 24*time.Hour, "at startup, delete partial-failure rows older than this (0 disables)")
 	retries := fs.Int("retries", 2, "seed: extra attempts through another proxy when blocked or failed")
 	rps := fs.Float64("rps", 0, "seed: global request rate cap (requests/sec); 0 = unlimited")
-	proxyRateLimit := fs.Int("proxy-rate-limit", 0, "seed: max requests per -proxy-rate-window each proxy may make; it sleeps when full to stay under a target's per-identity limit (e.g. 9); 0 = unlimited (config: proxy_rate_limit)")
-	proxyRateWindow := fs.Duration("proxy-rate-window", time.Minute, "seed: sliding window for -proxy-rate-limit (config: proxy_rate_window_seconds)")
 	proxyFails := fs.Int("proxy-fail-limit", 3, "consecutive transport failures before a proxy cools down")
 	proxyCool := fs.Duration("proxy-cooldown", time.Minute, "how long an unhealthy proxy is skipped")
 	outFile := fs.String("out", "", "write per-request results to this .csv or .jsonl file")
@@ -693,8 +692,6 @@ func parseFlags(args []string, out io.Writer) (config, error) {
 		blockPrune:       *blockPrune,
 		retries:          *retries,
 		rps:              *rps,
-		proxyRateLimit:   *proxyRateLimit,
-		proxyRateWindow:  *proxyRateWindow,
 		proxyFails:       *proxyFails,
 		proxyCool:        *proxyCool,
 		out:              *outFile,
