@@ -68,9 +68,10 @@ type Job struct {
 	Method string
 	Params string
 
-	// RateLimit/RateWindow are this target's per-URL sliding-window cap: at most
-	// RateLimit requests may start within any trailing RateWindow for this URL,
-	// across all proxies. <=0 RateLimit disables it. Set from the urls row.
+	// RateLimit/RateWindow are this target's sliding-window cap, applied per proxy:
+	// at most RateLimit requests may start within any trailing RateWindow for this
+	// URL through any one proxy (keyed per (proxy, URL); ProxyID 0 = direct). <=0
+	// RateLimit disables it. Set from the urls row.
 	RateLimit  int
 	RateWindow time.Duration
 }
@@ -380,10 +381,10 @@ func (p *Pool) fire(ctx context.Context, client *httpclient.Client, job Job, dom
 			return res
 		}
 	}
-	// Per-URL sliding-window cap: block until this URL (store) is back under its
-	// budget so each store stays within its own per-identity rate limit, regardless
-	// of which proxy serves the request.
-	if err := p.rateLimiter.wait(ctx, job.URL, job.RateLimit, job.RateWindow); err != nil {
+	// Per-(proxy, URL) sliding-window cap: block until this proxy's own budget for
+	// this URL is back under the limit. Each proxy carries an independent count and
+	// sleep per URL, so one proxy being throttled on a URL doesn't hold up the others.
+	if err := p.rateLimiter.wait(ctx, rateKey(client.ProxyID, job.URL), job.RateLimit, job.RateWindow); err != nil {
 		res.Err = err
 		return res
 	}
@@ -479,7 +480,7 @@ func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job J
 			return res
 		}
 	}
-	if err := p.rateLimiter.wait(ctx, job.URL, job.RateLimit, job.RateWindow); err != nil {
+	if err := p.rateLimiter.wait(ctx, rateKey(client.ProxyID, job.URL), job.RateLimit, job.RateWindow); err != nil {
 		res.Err = err
 		return res
 	}

@@ -33,11 +33,12 @@ type Target struct {
 	Requests int     `bun:"requests,notnull,default:0" json:"requests"` // 0 = until blocked
 	Enabled  bool    `bun:"enabled,notnull,default:true" json:"enabled"`
 
-	// RateLimit/RateWindowSecs are this URL's own sliding-window rate cap: at most
-	// RateLimit requests may start within any trailing RateWindowSecs window for this
-	// URL, across all proxies. 0 RateLimit = unlimited; RateWindowSecs <=0 defaults
-	// to 60s (see RateWindow). Lets each store self-throttle to its API's per-token
-	// limit (e.g. Shopify/Recharge N/min) independently of the other targets.
+	// RateLimit/RateWindowSecs are this URL's sliding-window rate cap, applied per
+	// proxy: at most RateLimit requests may start within any trailing RateWindowSecs
+	// window for this URL through any one proxy (the pool keys the budget per
+	// (proxy, URL); ProxyID 0 = direct). 0 RateLimit = unlimited; RateWindowSecs <=0
+	// defaults to 60s (see RateWindow). Each proxy self-throttles per URL
+	// independently of the other proxies and the other targets.
 	RateLimit      int `bun:"rate_limit,notnull,default:0" json:"rate_limit"`
 	RateWindowSecs int `bun:"rate_window_seconds,notnull,default:0" json:"rate_window_seconds"`
 }

@@ -91,6 +91,36 @@ func TestWindowLimiterPerKeyDifferentLimits(t *testing.T) {
 	}
 }
 
+// rateKey keeps each (proxy, URL) pair on its own budget: same URL through a
+// different proxy is a different key, so one proxy's full window does not block
+// another proxy on the same URL.
+func TestRateKeyPerProxyIndependent(t *testing.T) {
+	l := newWindowLimiter()
+	ctx := context.Background()
+	const url = "https://store.ae/checkout"
+
+	// Proxy 1 spends its single-slot budget for the URL.
+	if err := l.wait(ctx, rateKey(1, url), 1, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// Proxy 2, same URL, still has its own full allowance — must not block.
+	done := make(chan struct{})
+	go func() { _ = l.wait(ctx, rateKey(2, url), 1, time.Second); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("proxy 2 blocked on proxy 1's budget for the same URL")
+	}
+
+	// Distinct keys for distinct pairs, and the direct client (0) is its own key.
+	if rateKey(1, url) == rateKey(2, url) {
+		t.Fatal("different proxies must yield different keys")
+	}
+	if rateKey(1, "a") == rateKey(1, "b") {
+		t.Fatal("different URLs must yield different keys")
+	}
+}
+
 // A cancelled context unblocks a waiter instead of sleeping the whole window.
 func TestWindowLimiterContextCancel(t *testing.T) {
 	l := newWindowLimiter()

@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -11,15 +12,20 @@ import (
 // a key's allowance is spent, wait blocks until that key's oldest in-window request
 // ages out, then admits and records the new one.
 //
-// The pool keys it by target URL, so each URL (each store) has its own request
-// count and sleep — every proxy hitting that URL shares one budget. This keeps each
-// store within its own per-identity rate limit (e.g. a Shopify/Recharge API token
-// capped at N/minute) by self-throttling: it respects the limit, it does not defeat
-// it. limit and window are supplied per call (from the urls row), so different
-// stores can carry different caps.
+// The pool keys it per (proxy, URL) — see rateKey — so each proxy carries its own
+// request count and sleep for each target URL, independently of the other proxies
+// and the other URLs. limit and window are supplied per call (from the urls row),
+// so different URLs can carry different caps.
 type windowLimiter struct {
 	mu   sync.Mutex
 	hits map[string][]time.Time // request start times still inside the window, per key
+}
+
+// rateKey builds the per-(proxy, URL) limiter key: a given proxy's budget for a
+// given URL is tracked separately from every other (proxy, URL) pair. ProxyID 0 is
+// the direct client.
+func rateKey(proxyID int64, url string) string {
+	return strconv.FormatInt(proxyID, 10) + "\x00" + url
 }
 
 func newWindowLimiter() *windowLimiter {
