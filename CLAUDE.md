@@ -51,6 +51,38 @@ is blocked — per-URL value lives in the `urls` table), `-retries` (2), `-rps`
 (0 = unlimited), `-timeout`, `-human` (true), `-user-agent`, `-insecure`, `-cache-bust`
 (+`-cache-bust-param`, default `_`).
 
+**Per-(proxy, URL) rate limit (`urls` columns, no CLI flag).** `-rps` is a single global
+request/second cap shared by every target and proxy. Separately, each `urls` row carries
+its **own** sliding-window cap via two per-row columns (no CLI flag, no `config` key) —
+`rate_limit` (0 = unlimited) and `rate_window_seconds` (defaults to 60 when unset/0).
+Semantics: the budget is tracked **per (proxy, URL) pair** (`rateKey(ProxyID, URL)` in
+`internal/pool/ratelimit.go`; ProxyID 0 = direct). For a given URL, each proxy may start
+at most `rate_limit` requests within any trailing `rate_window_seconds` *on its own*; when
+a proxy's budget for that URL is full, that worker *sleeps* until the proxy's oldest
+in-window request on the URL ages out, while other proxies (and other URLs) keep firing
+independently. Example: with `rate_limit=9, rate_window_seconds=60`, proxy `1.2.3.4` does
+9 requests to `xxx.example.ae` in the first 10s then sleeps ~50s for *that* URL, yet the
+same proxy still has a separate full budget for `yyy.example.ae`, and proxy `5.6.7.8` has
+its own 9 for `xxx.example.ae`. The columns are added idempotently on startup
+(`ALTER TABLE urls ADD COLUMN IF NOT EXISTS`, default 0); set them per row and the
+watcher restarts the run with the new values (NOTIFY, or the `-watch-poll` fallback).
+`Job.RateLimit`/`RateWindow` carry the per-row values into the pool; `Target.RateWindow()`
+applies the 60s default. It respects the limit, it does not defeat it.
+
+**Skip-log coalescing (`config` key, no CLI flag).** When every proxy is blocked/cooled
+down for a domain, each job returns `ErrAllBlocked` and the error log would write one
+"no usable proxy" line per request — a flood. The `config` key `skip_log_interval_seconds`
+(seeded to 30 on first run, no CLI flag) coalesces these per domain: one line when a
+domain starts skipping, at most one summary with a suppressed count per interval while it
+stays blocked, and one recovery line when a proxy is usable again — so the blocked/
+recovered state stays visible without the spam. `0` logs every skip (coalescing off).
+`skipCoalescer` wraps `errorLogHandler` in `main.go` and reads the interval **live** via a
+`skipIntervalOf` closure over `config.Repo.Load` (keeping the last good value on a load
+error), so editing the key takes effect without restarting — the same pattern the reporter
+uses for `report_interval_seconds`. `onUsable` runs on every result, so it has a lock-free
+fast path (an atomic "active skips" counter) to stay off the hot path when nothing is
+blocked.
+
 **Operational flags** (stay on the CLI): `-dsn` (or `DATABASE_DSN` env), `-proxies`
 (seed the DB then run), `-block-after` (5), `-block-for` (30m), `-block-ttl` (5s
 per-domain cache trust), `-block-cache-max` (1024 domains, LRU), `-block-prune` (24h
@@ -66,7 +98,9 @@ query string for GET/HEAD/DELETE, request body for POST/PUT/PATCH; for browser: 
 `{"steps":[...]}` flow, see below), `weight` (relative share of the worker pool,
 normalized), `requests` (http: 0 = until blocked; browser: always finite — `1` runs
 the flow once as a single test, `N` repeats it under load, and `0`/unset falls back
-to the global default count since browser has no "until blocked" mode), `enabled`. New columns are added on startup
+to the global default count since browser has no "until blocked" mode), `enabled`,
+`rate_limit` (sliding-window cap per (proxy, URL), 0 = unlimited) and `rate_window_seconds`
+(the window for it, 0 → 60s) — see "Per-(proxy, URL) rate limit" above. New columns are added on startup
 via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (still no migration tool).
 
 **Browser mode (`mode='browser'`):** `params` is a JSON flow run in a headless
@@ -153,7 +187,8 @@ Packages under `internal/`:
 
 - **`config`** — the DB source of truth for a run, in two parts:
   - `Setting` (key/value `config` table) + `Repo`: the *run params* (workers, requests,
-    retries, rps, timeout, cache-bust, human, user-agent, insecure), encoded as k/v rows.
+    retries, rps, timeout, cache-bust, human, user-agent, insecure, report +
+    skip-log intervals), encoded as k/v rows.
     `Repo` has `EnsureSchema` (table + the shared `dd_config_notify` trigger),
     `EnsureDefault` (seed the k/v rows only if the table is empty), `Load` (assemble a
     `Config`), `Save` (upsert k/v), and `Watch(ctx, WatchOptions)` which turns Postgres
@@ -167,7 +202,8 @@ Packages under `internal/`:
     it isn't received within 5s. `Config.Requests` is the global default used to seed
     new target rows and as the direct-mode fallback.
   - `Target` (table `urls`) + `TargetRepo`: one row per URL with `mode` (`http`/
-    `browser`), `method`, `params` (JSON), `weight`, `requests`, `enabled`.
+    `browser`), `method`, `params` (JSON), `weight`, `requests`, `enabled`,
+    `rate_limit`, `rate_window_seconds` (sliding-window rate cap per (proxy, URL)).
     `EnsureSchema` creates the table, adds later columns idempotently (`ALTER TABLE
     ... ADD COLUMN IF NOT EXISTS`, e.g. `mode`), and installs a NOTIFY trigger on
     `urls` firing the same `config_changed` channel, so editing a target restarts the
@@ -215,7 +251,12 @@ Packages under `internal/`:
   1. `pick()` — chooses a **random** usable client (`rand.Perm`), skipping proxies that are
      health-cooled-down or quarantined for the domain, and any already tried this job;
   2. execute — `fire()` for http, or `fireBrowser()` for `mode=browser`, gated by the
-     same optional `-rps` rate limit (`x/time/rate`). `fire()` sends the request via
+     same optional `-rps` global rate limit (`x/time/rate`) and then the
+     sliding-window cap (`windowLimiter` in `ratelimit.go`, keyed per (proxy, URL) via
+     `rateKey(client.ProxyID, job.URL)`, with the limit/window from
+     `Job.RateLimit`/`RateWindow`): the worker blocks until this proxy's budget for
+     this URL is back under the limit, so each proxy self-throttles per URL
+     independently of the others. `fire()` sends the request via
      `req.Execute(method, url)`: for GET/HEAD/DELETE the JSON `Params` merge into the
      query (`jsonToQuery`), for POST/PUT/PATCH they become the JSON body (`params.go`).
      `fireBrowser()` parses the flow and calls `internal/browser.Execute` through the

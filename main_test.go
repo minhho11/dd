@@ -1,6 +1,16 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"errors"
+	"log"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/minhho11/dd/internal/pool"
+)
 
 func sum(xs []int) int {
 	t := 0
@@ -63,4 +73,79 @@ func TestAllocateWorkers(t *testing.T) {
 			t.Errorf("alloc = %v, want nil", got)
 		}
 	})
+}
+
+func TestErrorLogHandlerCoalescesSkips(t *testing.T) {
+	var buf bytes.Buffer
+	l := log.New(&buf, "", 0)
+	h := errorLogHandler(l, func() time.Duration { return time.Minute }) // long interval: no mid-window summary
+
+	skip := pool.Result{URL: "https://a.ae/x", Domain: "a.ae", Err: pool.ErrAllBlocked}
+	// Many skips for the same domain → exactly one "no usable proxy" line.
+	for i := 0; i < 100; i++ {
+		h(skip)
+	}
+	if n := strings.Count(buf.String(), "no usable proxy for domain=\"a.ae\""); n != 1 {
+		t.Fatalf("want 1 initial skip line, got %d\n%s", n, buf.String())
+	}
+
+	// A usable result for the domain → one recovery line.
+	h(pool.Result{URL: "https://a.ae/x", Domain: "a.ae", StatusCode: 200})
+	if !strings.Contains(buf.String(), "usable proxy recovered for domain=\"a.ae\"") {
+		t.Fatalf("want recovery line, got:\n%s", buf.String())
+	}
+
+	// After recovery, skipping again logs a fresh initial line (2 total now).
+	h(skip)
+	if n := strings.Count(buf.String(), "no usable proxy for domain=\"a.ae\""); n != 2 {
+		t.Fatalf("want 2 initial skip lines after re-entry, got %d\n%s", n, buf.String())
+	}
+}
+
+func TestErrorLogHandlerSkipIntervalZeroLogsEach(t *testing.T) {
+	var buf bytes.Buffer
+	l := log.New(&buf, "", 0)
+	h := errorLogHandler(l, func() time.Duration { return 0 }) // disabled: every skip logs
+
+	skip := pool.Result{URL: "https://a.ae/x", Domain: "a.ae", Err: pool.ErrAllBlocked}
+	for i := 0; i < 5; i++ {
+		h(skip)
+	}
+	if n := strings.Count(buf.String(), "no usable proxy"); n != 5 {
+		t.Fatalf("want 5 skip lines with interval=0, got %d\n%s", n, buf.String())
+	}
+}
+
+func TestErrorLogHandlerReadsIntervalLive(t *testing.T) {
+	var buf bytes.Buffer
+	l := log.New(&buf, "", 0)
+	var interval atomic.Int64
+	interval.Store(int64(time.Minute)) // start coalescing on
+	h := errorLogHandler(l, func() time.Duration { return time.Duration(interval.Load()) })
+
+	skip := pool.Result{URL: "https://a.ae/x", Domain: "a.ae", Err: pool.ErrAllBlocked}
+	h(skip)
+	h(skip)
+	if n := strings.Count(buf.String(), "no usable proxy"); n != 1 {
+		t.Fatalf("coalescing on: want 1 line, got %d\n%s", n, buf.String())
+	}
+
+	// Flip the config to 0 (coalescing off) live: subsequent skips each log.
+	interval.Store(0)
+	h(skip)
+	h(skip)
+	if n := strings.Count(buf.String(), "no usable proxy"); n != 3 {
+		t.Fatalf("after live switch to every-skip: want 3 total, got %d\n%s", n, buf.String())
+	}
+}
+
+func TestErrorLogHandlerStillLogsRequestErrors(t *testing.T) {
+	var buf bytes.Buffer
+	l := log.New(&buf, "", 0)
+	h := errorLogHandler(l, func() time.Duration { return time.Minute })
+
+	h(pool.Result{URL: "https://a.ae/x", Domain: "a.ae", ProxyURL: "http://p:1", Attempts: 3, Err: errors.New("dial timeout")})
+	if !strings.Contains(buf.String(), "request error") || !strings.Contains(buf.String(), "dial timeout") {
+		t.Fatalf("want request error line, got:\n%s", buf.String())
+	}
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"time"
 
 	"github.com/uptrace/bun"
 )
@@ -31,6 +32,24 @@ type Target struct {
 	Weight   float64 `bun:"weight,notnull,default:1" json:"weight"`
 	Requests int     `bun:"requests,notnull,default:0" json:"requests"` // 0 = until blocked
 	Enabled  bool    `bun:"enabled,notnull,default:true" json:"enabled"`
+
+	// RateLimit/RateWindowSecs are this URL's sliding-window rate cap, applied per
+	// proxy: at most RateLimit requests may start within any trailing RateWindowSecs
+	// window for this URL through any one proxy (the pool keys the budget per
+	// (proxy, URL); ProxyID 0 = direct). 0 RateLimit = unlimited; RateWindowSecs <=0
+	// defaults to 60s (see RateWindow). Each proxy self-throttles per URL
+	// independently of the other proxies and the other targets.
+	RateLimit      int `bun:"rate_limit,notnull,default:0" json:"rate_limit"`
+	RateWindowSecs int `bun:"rate_window_seconds,notnull,default:0" json:"rate_window_seconds"`
+}
+
+// RateWindow returns this target's sliding-window duration, defaulting to 60s when
+// unset/non-positive. The cap itself stays disabled while RateLimit is <=0.
+func (t Target) RateWindow() time.Duration {
+	if t.RateWindowSecs <= 0 {
+		return time.Minute
+	}
+	return time.Duration(t.RateWindowSecs) * time.Second
 }
 
 // TargetRepo reads/writes the `urls` table.
@@ -52,9 +71,15 @@ func (r *TargetRepo) EnsureSchema(ctx context.Context) error {
 	}
 	// Add columns introduced after the table's first creation (no migration tool);
 	// idempotent so it is safe on every startup.
-	if _, err := r.db.ExecContext(ctx,
-		`ALTER TABLE urls ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'http'`); err != nil {
-		return err
+	alters := []string{
+		`ALTER TABLE urls ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'http'`,
+		`ALTER TABLE urls ADD COLUMN IF NOT EXISTS rate_limit integer NOT NULL DEFAULT 0`,
+		`ALTER TABLE urls ADD COLUMN IF NOT EXISTS rate_window_seconds integer NOT NULL DEFAULT 0`,
+	}
+	for _, s := range alters {
+		if _, err := r.db.ExecContext(ctx, s); err != nil {
+			return err
+		}
 	}
 	stmts := []string{
 		`CREATE OR REPLACE FUNCTION dd_config_notify() RETURNS trigger AS $$

@@ -67,6 +67,13 @@ type Job struct {
 	Mode   string
 	Method string
 	Params string
+
+	// RateLimit/RateWindow are this target's sliding-window cap, applied per proxy:
+	// at most RateLimit requests may start within any trailing RateWindow for this
+	// URL through any one proxy (keyed per (proxy, URL); ProxyID 0 = direct). <=0
+	// RateLimit disables it. Set from the urls row.
+	RateLimit  int
+	RateWindow time.Duration
 }
 
 // Result records the final outcome of one Job (after any retries).
@@ -88,9 +95,13 @@ type Result struct {
 
 // Options configures a Pool.
 type Options struct {
-	Workers        int
-	Retries        int           // extra attempts through other proxies on block/error
-	RPS            float64       // global request rate cap; <=0 means unlimited
+	Workers int
+	Retries int     // extra attempts through other proxies on block/error
+	RPS     float64 // global request rate cap; <=0 means unlimited
+
+	// Per-URL sliding-window rate limits are not set here: they travel on each Job
+	// (Job.RateLimit/RateWindow, from the urls row), so every target/store carries
+	// its own cap.
 	ProxyFailLimit int           // consecutive transport failures before a proxy cools down
 	ProxyCooldown  time.Duration // how long an unhealthy proxy is skipped
 	CacheBust      bool          // append a unique query param to each request
@@ -184,9 +195,10 @@ type Pool struct {
 	workers      int
 	retries      int
 	clients      *httpclient.Pool
-	blocks       BlockStore    // optional; nil disables the domain-block feedback loop
-	limiter      *rate.Limiter // optional; nil means unlimited
-	health       *health       // proxy transport-failure circuit breaker
+	blocks       BlockStore     // optional; nil disables the domain-block feedback loop
+	limiter      *rate.Limiter  // optional global rate cap; nil means unlimited
+	rateLimiter  *windowLimiter // per-URL sliding-window cap (keyed by job URL)
+	health       *health        // proxy transport-failure circuit breaker
 	cacheBust    bool
 	cbParam      string
 	browser      browser.Options // browser-mode execution options
@@ -216,14 +228,15 @@ func New(clients *httpclient.Pool, blocks BlockStore, opts Options) *Pool {
 		limiter = rate.NewLimiter(rate.Limit(opts.RPS), burst)
 	}
 	return &Pool{
-		workers:   opts.Workers,
-		retries:   opts.Retries,
-		clients:   clients,
-		blocks:    blocks,
-		limiter:   limiter,
-		health:    newHealth(opts.ProxyFailLimit, opts.ProxyCooldown),
-		cacheBust: opts.CacheBust,
-		cbParam:   opts.CacheBustParam,
+		workers:     opts.Workers,
+		retries:     opts.Retries,
+		clients:     clients,
+		blocks:      blocks,
+		limiter:     limiter,
+		rateLimiter: newWindowLimiter(),
+		health:      newHealth(opts.ProxyFailLimit, opts.ProxyCooldown),
+		cacheBust:   opts.CacheBust,
+		cbParam:     opts.CacheBustParam,
 		browser: browser.Options{
 			Headless:  opts.Headless,
 			Timeout:   opts.BrowserTimeout,
@@ -368,6 +381,13 @@ func (p *Pool) fire(ctx context.Context, client *httpclient.Client, job Job, dom
 			return res
 		}
 	}
+	// Per-(proxy, URL) sliding-window cap: block until this proxy's own budget for
+	// this URL is back under the limit. Each proxy carries an independent count and
+	// sleep per URL, so one proxy being throttled on a URL doesn't hold up the others.
+	if err := p.rateLimiter.wait(ctx, rateKey(client.ProxyID, job.URL), job.RateLimit, job.RateWindow); err != nil {
+		res.Err = err
+		return res
+	}
 
 	// Cache busting: a unique query param per request so a caching layer forwards
 	// each one to origin instead of serving one cached copy. Result.URL keeps the
@@ -459,6 +479,10 @@ func (p *Pool) fireBrowser(ctx context.Context, client *httpclient.Client, job J
 			res.Err = err
 			return res
 		}
+	}
+	if err := p.rateLimiter.wait(ctx, rateKey(client.ProxyID, job.URL), job.RateLimit, job.RateWindow); err != nil {
+		res.Err = err
+		return res
 	}
 
 	flow, err := browser.ParseFlow(job.Params)

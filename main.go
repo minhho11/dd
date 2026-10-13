@@ -20,6 +20,8 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -149,6 +151,29 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 		blocks = cache
 	}
 
+	// The config table is the live source of truth for intervals read outside a run
+	// (the reporter's report_interval_seconds and the error log's
+	// skip_log_interval_seconds). Ensure + seed it once here so those closures can
+	// read it before the first run; runFromDB ensures + seeds again (idempotent).
+	cfgRepo := cfgdb.NewRepo(database)
+	if err := cfgRepo.EnsureSchema(ctx); err != nil {
+		return fmt.Errorf("ensure config schema: %w", err)
+	}
+	if err := cfgRepo.EnsureDefault(ctx, cliRunConfig(cfg)); err != nil {
+		return fmt.Errorf("seed config: %w", err)
+	}
+
+	// skipIntervalOf reads the current skip-log coalescing interval from the config
+	// table live (keeping the last good value on a load error), so a config edit takes
+	// effect without restarting the error-log handler.
+	lastSkip := 30 * time.Second
+	skipIntervalOf := func() time.Duration {
+		if rc, lerr := cfgRepo.Load(ctx); lerr == nil {
+			lastSkip = rc.SkipLogInterval()
+		}
+		return lastSkip
+	}
+
 	// Reporting: an in-memory per-URL tally upserted into the report table every
 	// report interval. The interval lives in the config table (report_interval_seconds,
 	// seeded from -report-interval) so it can be changed live; the reporter re-reads
@@ -160,15 +185,6 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 	if cfg.skipReport {
 		fmt.Fprintln(out, "report table disabled (-skip-report)")
 	} else {
-		// The config table is the source of the interval, so ensure + seed it before
-		// the reporter reads it. runFromDB ensures + seeds again (idempotent).
-		cfgRepo := cfgdb.NewRepo(database)
-		if err := cfgRepo.EnsureSchema(ctx); err != nil {
-			return fmt.Errorf("ensure config schema: %w", err)
-		}
-		if err := cfgRepo.EnsureDefault(ctx, cliRunConfig(cfg)); err != nil {
-			return fmt.Errorf("seed config: %w", err)
-		}
 		reportRepo := metrics.NewRepo(database)
 		if err := reportRepo.EnsureSchema(ctx); err != nil {
 			return fmt.Errorf("ensure report schema: %w", err)
@@ -193,7 +209,7 @@ func run(parent context.Context, args []string, out io.Writer) (err error) {
 		fmt.Fprintf(out, "reporting per-URL success/fail to `report` table every %s (config.report_interval_seconds)\n", intervalOf())
 	}
 
-	onResult, closeHandlers, err := buildResultHandler(cfg, out, errLog, mtx)
+	onResult, closeHandlers, err := buildResultHandler(cfg, out, errLog, mtx, skipIntervalOf)
 	if err != nil {
 		return err
 	}
@@ -280,21 +296,24 @@ func cliRunConfig(cfg config) cfgdb.Config {
 		RPS:                   cfg.rps,
 		TimeoutSeconds:        int(cfg.timeout / time.Second),
 		ReportIntervalSeconds: int(cfg.reportInterval / time.Second),
-		CacheBust:             cfg.cacheBust,
-		CacheBustParam:        cfg.cacheBustParam,
-		Human:                 cfg.human,
-		UserAgent:             cfg.userAgent,
-		Insecure:              cfg.insecure,
-		BrowserDebug:          cfg.browserDebug,
-		BrowserMax:            cfg.browserMax,
-		BrowserReuse:          cfg.browserReuse,
-		BrowserBlock:          cfg.browserBlock,
+		// No CLI flag: configured only via the config table (skip_log_interval_seconds),
+		// read live by the error-log handler. Seed a 30s default (0 = log every skip).
+		SkipLogIntervalSeconds: 30,
+		CacheBust:              cfg.cacheBust,
+		CacheBustParam:         cfg.cacheBustParam,
+		Human:                  cfg.human,
+		UserAgent:              cfg.userAgent,
+		Insecure:               cfg.insecure,
+		BrowserDebug:           cfg.browserDebug,
+		BrowserMax:             cfg.browserMax,
+		BrowserReuse:           cfg.browserReuse,
+		BrowserBlock:           cfg.browserBlock,
 	}
 }
 
 // buildResultHandler composes the per-result callback (metrics, verbose print,
 // export, error log), plus a cleanup that closes the exporter.
-func buildResultHandler(cfg config, out io.Writer, errLog *log.Logger, mtx *metrics.Metrics) (func(pool.Result), func(), error) {
+func buildResultHandler(cfg config, out io.Writer, errLog *log.Logger, mtx *metrics.Metrics, skipIntervalOf func() time.Duration) (func(pool.Result), func(), error) {
 	var handlers []func(pool.Result)
 	cleanup := func() {}
 
@@ -321,7 +340,7 @@ func buildResultHandler(cfg config, out io.Writer, errLog *log.Logger, mtx *metr
 		fmt.Fprintf(out, "writing results to %s\n", cfg.out)
 	}
 	if errLog != nil {
-		handlers = append(handlers, errorLogHandler(errLog))
+		handlers = append(handlers, errorLogHandler(errLog, skipIntervalOf))
 	}
 
 	if len(handlers) == 0 {
@@ -521,7 +540,10 @@ func isBrowserMode(mode string) bool {
 func produceTarget(ctx context.Context, wp *pool.Pool, t cfgdb.Target, rc cfgdb.Config, hasProxies bool, jobs chan<- pool.Job) {
 	defer close(jobs)
 	mk := func() pool.Job {
-		return pool.Job{URL: t.URL, Mode: t.Mode, Method: t.Method, Params: t.Params}
+		return pool.Job{
+			URL: t.URL, Mode: t.Mode, Method: t.Method, Params: t.Params,
+			RateLimit: t.RateLimit, RateWindow: t.RateWindow(),
+		}
 	}
 
 	// "Until blocked" (requests=0 with proxies) applies to http targets only.
@@ -772,13 +794,24 @@ func verbosePrinter(out io.Writer) func(pool.Result) {
 // (no usable proxy). Blocked/non-2xx responses are not errors — they belong in
 // the summary and the -out export, not the error log. Safe for concurrent use
 // (log.Logger locks internally).
-func errorLogHandler(l *log.Logger) func(pool.Result) {
+//
+// "No usable proxy" skips (ErrAllBlocked) are coalesced per domain by a
+// skipCoalescer so an all-proxies-blocked domain logs one line when it starts
+// skipping, at most one summary per skip interval while it stays blocked, and one
+// recovery line when a proxy becomes usable again — instead of a line per request.
+// The interval is read live from skipIntervalOf (the config table's
+// skip_log_interval_seconds); <= 0 keeps the old behavior (a line per skip).
+func errorLogHandler(l *log.Logger, skipIntervalOf func() time.Duration) func(pool.Result) {
+	skips := newSkipCoalescer(l, skipIntervalOf)
 	return func(r pool.Result) {
-		if r.Err == nil {
+		if errors.Is(r.Err, pool.ErrAllBlocked) {
+			skips.onSkip(r.Domain)
 			return
 		}
-		if errors.Is(r.Err, pool.ErrAllBlocked) {
-			l.Printf("skipped url=%q domain=%q: no usable proxy", r.URL, r.Domain)
+		// Any non-skip result for the domain means a proxy was usable again: let the
+		// coalescer emit a one-line recovery if it had been skipping.
+		skips.onUsable(r.Domain)
+		if r.Err == nil {
 			return
 		}
 		via := "direct"
@@ -787,6 +820,77 @@ func errorLogHandler(l *log.Logger) func(pool.Result) {
 		}
 		l.Printf("request error url=%q via=%s attempts=%d: %v", r.URL, via, r.Attempts, r.Err)
 	}
+}
+
+// skipCoalescer collapses repeated "no usable proxy" skips per domain into state
+// transitions plus a throttled running count, so a fully-blocked domain does not
+// flood the error log while still making the blocked/recovered state visible.
+type skipCoalescer struct {
+	l          *log.Logger
+	intervalOf func() time.Duration // live interval from the config table
+
+	active atomic.Int64 // domains currently skipping; a lock-free fast path for onUsable
+	mu     sync.Mutex
+	st     map[string]*domainSkip
+}
+
+type domainSkip struct {
+	skipping   bool
+	suppressed int       // skips hidden since the last logged line for this domain
+	lastLog    time.Time // when we last logged for this domain
+}
+
+func newSkipCoalescer(l *log.Logger, intervalOf func() time.Duration) *skipCoalescer {
+	return &skipCoalescer{l: l, intervalOf: intervalOf, st: make(map[string]*domainSkip)}
+}
+
+func (c *skipCoalescer) onSkip(domain string) {
+	interval := c.intervalOf()
+	// interval <= 0 disables coalescing: log every skip as before.
+	if interval <= 0 {
+		c.l.Printf("skipped domain=%q: no usable proxy", domain)
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.st[domain]
+	if s == nil {
+		s = &domainSkip{}
+		c.st[domain] = s
+	}
+	if !s.skipping {
+		s.skipping = true
+		s.suppressed = 0
+		s.lastLog = now
+		c.active.Add(1)
+		c.l.Printf("no usable proxy for domain=%q — all proxies blocked/cooled down; suppressing repeats", domain)
+		return
+	}
+	s.suppressed++
+	if now.Sub(s.lastLog) >= interval {
+		c.l.Printf("still no usable proxy for domain=%q (%d skips in last %s)", domain, s.suppressed, now.Sub(s.lastLog).Round(time.Second))
+		s.suppressed = 0
+		s.lastLog = now
+	}
+}
+
+func (c *skipCoalescer) onUsable(domain string) {
+	// Lock-free fast path: when no domain is skipping (the healthy steady state),
+	// every result hits this and must not contend on the mutex. (A coalescing-off
+	// interval never marks a domain active, so active==0 covers that case too.)
+	if c.active.Load() == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.st[domain]
+	if s == nil || !s.skipping {
+		return
+	}
+	c.l.Printf("usable proxy recovered for domain=%q (after %d suppressed skips)", domain, s.suppressed)
+	delete(c.st, domain)
+	c.active.Add(-1)
 }
 
 // metricsHandler records each result into the in-memory per-URL tally. A result
